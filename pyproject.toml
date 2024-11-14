@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlogger"
+version = "0.0.1"
+authors = [
+    { name = "Ishan Karmakar", email = "ishan.karmakar24@gmail.com" }
+    # { name = "Thomas Godden", email = "" } ; I don't know email
+]
+description = "FRC post match + live practice quick analysis framework"
+dependencies = [
+    "msgpack",
+    "protobuf",
+    "websockets",
+    "matplotlib",
+    "seaborn"
+]
+requires-python = ">=3.8"
+
+[project.scripts]
+vlogger = "vlogger.__main__:run"
+
+[project.entry-points."pipx.run"]
+vlogger = "vlogger.__main__:run"
+
+[project-urls]
+Homepage = "https://git.valor6800.com/valor6800/2025/vlogger"
+Issues = "https://git.valor6800.com/valor6800/2025/vlogger/-/issues"
