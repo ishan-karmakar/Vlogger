@@ -1,9 +1,4 @@
 import abc
-from enum import Enum
-
-class SourceType(Enum):
-    LIVE = 0
-    HISTORICAL = 1
 
 class Source(abc.ABC):
     @abc.abstractmethod

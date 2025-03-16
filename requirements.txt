@@ -1,5 +1,0 @@
-msgpack
-protobuf
-websockets
-matplotlib
-seaborn

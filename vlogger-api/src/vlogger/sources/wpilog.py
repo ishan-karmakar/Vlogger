@@ -1,5 +1,5 @@
 import logging
-from vlogger.sources import Source, SourceType
+from vlogger.sources import Source
 from vlogger.sources.types import TypeDecoder
 import os, io, re
 logger = logging.getLogger(__name__)
@@ -8,9 +8,7 @@ STRUCT_PREFIX = SCHEMA_PREFIX + "/struct:"
 PROTO_PREFIX = SCHEMA_PREFIX + "/proto:"
 
 class WPILog(Source):
-    SOURCE_TYPE = SourceType.HISTORICAL
-
-    def __init__(self, regex_listeners, file, args):
+    def __init__(self, file, regex_listeners, **kwargs):
         # Map of regex -> listeners
         self.regex_listeners = regex_listeners.copy()
         # Add a dummy regex for all schemas
@@ -20,10 +18,10 @@ class WPILog(Source):
         self.type_decoder = TypeDecoder()
 
         if not file:
-            raise ValueError
+            raise FileNotFoundError
         self.file = open(file, "rb")
         if self.file.read(6) != b"WPILOG":
-            raise ValueError
+            raise ValueError("WPILog signature not found when parsing file")
 
     def close(self):
         self.file.close()

@@ -1,17 +1,19 @@
-from vlogger.sources import Source, SourceType
+from vlogger.sources import Source
 from vlogger.sources.types import TypeDecoder
-from websockets.sync import client
-import json, msgpack, logging, re, io, threading, queue
-from msgpack import Unpacker
+import json, logging, re, io, threading, queue
+import socket
 logger = logging.getLogger(__name__)
 
 STRUCT_PREFIX = "struct:"
 
 class NetworkTables4(Source):
-    SOURCE_TYPE = SourceType.LIVE
-
-    def __init__(self, regex_listeners, ip, args):
-        self.ip = ip
+    def __init__(self, hostname, regex_listeners, **kwargs):
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Will raise ConnectionRefusedError if can't connect
+        # FIXME: Check for signature or equivalent to make sure it is correct live source
+        client_socket.connect((hostname, 5810))
+        client_socket.close()
+        self.hostname = hostname
         self.regex_listeners = regex_listeners.copy()
         self.regex_listeners[f"^{re.escape("NT:/.schema/")}"] = set()
         self.cur_subuid = 0
@@ -26,6 +28,7 @@ class NetworkTables4(Source):
         return self
     
     def _init_main(self):
+        from websockets.sync import client
         with client.connect(f"ws://{self.ip}:5810/nt/vlogger", subprotocols=[client.Subprotocol("v4.1.networktables.first.wpi.edu"), client.Subprotocol("networktables.first.wpi.edu")]) as websocket:
             logger.info("Successfully connected to NT4 server")
             self.websocket = websocket
@@ -94,6 +97,8 @@ class NetworkTables4(Source):
         pass
 
     def _decode_msgpack(self, msg_raw: bytes):
+        from websockets import exceptions
+        from msgpack import Unpacker
         decoded = []
         unpacker = Unpacker(io.BytesIO(msg_raw))
         try:
@@ -102,7 +107,7 @@ class NetworkTables4(Source):
                 for i in range(unpacker.read_array_header()):
                     tmp.append(unpacker.unpack())
                 decoded.append(tmp)
-        except msgpack.exceptions.OutOfData:
+        except exceptions.OutOfData:
             return decoded
         
     def _handle_command(self, msg):

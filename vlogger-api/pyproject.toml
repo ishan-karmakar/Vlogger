@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frc-vlogger"
+description = "FRC post match + live match logging reader abstraction"
+version = "1.0.0"
+authors = [
+    { name = "Ishan Karmakar", email = "ishan.karmakar24@gmail.com" },
+    { name = "Thomas Godden", email = "thomas.godden@outlook.com" }
+]
+dependencies = ["protobuf"]
+requires-python = ">=3"
+
+[project.optional-dependencies]
+live = [
+    "msgpack",
+    "websockets"
+]
