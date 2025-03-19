@@ -13,7 +13,6 @@ class TypeDecoder:
         self.proto_pool = DescriptorPool()
 
     def __call__(self, field_info: dict, data: io.BytesIO):
-        print(field_info)
         dtype = field_info["dtype"]
         name = field_info["name"]
         if dtype == "raw": return data.read()

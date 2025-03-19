@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "frc-vlogger"
 license = { text = "Apache-2.0" }
 description = "FRC post match + live match logging reader abstraction"
-version = "1.1.1"
+version = "1.1.2"
 authors = [
     { name = "Ishan Karmakar", email = "ishan.karmakar24@gmail.com" },
     { name = "Thomas Godden", email = "thomas.godden@outlook.com" }
@@ -40,3 +40,4 @@ live = [
 [project.urls]
 Repository = "https://git.valor6800.com/valor6800/2025/vlogger"
 Issues = "https://git.valor6800.com/valor6800/2025/vlogger/-/issues"
+Changelog = "https://git.valor6800.com/valor6800/2025/vlogger/-/blob/main/CHANGELOG.md"

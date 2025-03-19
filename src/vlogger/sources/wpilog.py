@@ -31,6 +31,7 @@ class WPILog(Source):
         self.file.close()
 
     def __iter__(self):
+        # _parse_header seeks to start of file every time, no need to do it here
         self._parse_header()
         return self
     
@@ -41,6 +42,7 @@ class WPILog(Source):
                 return ret
 
     def _parse_header(self):
+        self.file.seek(6, os.SEEK_SET)
         version = int.from_bytes(self.file.read(2), "little")
         logger.debug(f"File version: {(version >> 8) & 0xFF}.{version & 0xFF}")
 
@@ -82,6 +84,12 @@ class WPILog(Source):
             logger.debug(f"Found start record for {entry_name}")
             if entry_name_length == 0:
                 raise Exception
+
+            entry_name = entry_name[3:] # Remove NT:
+            if not entry_name.startswith("/"):
+                entry_name = "/" + entry_name
+
+            entry_name = "NT:" + entry_name
 
             # Loop through all target fields and test against target regex
             for regex in self.regexes:
