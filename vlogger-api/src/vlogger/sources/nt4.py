@@ -20,7 +20,7 @@ class NetworkTables4(Source):
 
         self.hostname = hostname
         self.regexes = [re.compile(r) for r in regexes]
-        self.internal_regexes = [re.compile(f"^{re.escape("NT:/.schema/")}")]
+        self.internal_regexes = [re.compile("^" + re.escape("NT:/.schema/"))]
         self.cur_subuid = 0
         self.queue = queue.SimpleQueue()
         self.field_map = {}
@@ -79,15 +79,14 @@ class NetworkTables4(Source):
                             name = self.field_map[msg[0]]["name"]
                             dtype = self.field_map[msg[0]]["dtype"]
                             regexes = self.field_map[msg[0]]["regex"]
-                            if name.startswith(STRUCT_NT_PREFIX):
-                                self.type_decoder.add_struct(STRUCT_DTYPE_PREFIX + name.removeprefix(STRUCT_NT_PREFIX), msg[3].decode())
-                            elif name.startswith(PROTO_NT_PREFIX):
-                                self.type_decoder.add_proto(msg[3])
+                            data = msg[3]
+                            if type(data) == bytes:
+                                data = self.type_decoder({
+                                    "name": name,
+                                    "dtype": dtype
+                                }, io.BytesIO(data))
                             
                             if len(regexes):
-                                data = msg[3]
-                                if type(data) == bytes:
-                                    data = self.type_decoder(dtype, io.BytesIO(data))
                                 self.queue.put({
                                     "regexes": regexes,
                                     "name": name,

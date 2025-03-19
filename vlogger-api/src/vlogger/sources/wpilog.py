@@ -18,7 +18,7 @@ class WPILog(Source):
         # Map of regexes that are used by the client
         self.regexes = [re.compile(r) for r in regexes]
         # Map of regexes that are used internally, may overlap with self.regexes
-        self.internal_regexes = [re.compile(f"^{re.escape("NT:/.schema/")}")]
+        self.internal_regexes = [re.compile("^" + re.escape("NT:/.schema/"))]
         # Map of actual field ids -> listeners + data, will be populated when start records come
         self.field_map = {}
         self.type_decoder = TypeDecoder()
@@ -116,14 +116,11 @@ class WPILog(Source):
 
         topic = self.field_map[id]
         payload = self.file.read(payload_size)
-        if topic["name"].startswith(STRUCT_NT_PREFIX):
-            self.type_decoder.add_struct(STRUCT_DTYPE_PREFIX + topic["name"].removeprefix(STRUCT_NT_PREFIX), payload.decode())
-        elif topic["name"].startswith(PROTO_NT_PREFIX):
-            self.type_decoder.add_proto(payload)
+        data = self.type_decoder(topic, io.BytesIO(payload))
         if len(topic["regexes"]):
             return {
                 "regexes": topic["regexes"],
                 "name": topic["name"],
                 "timestamp": timestamp,
-                "data": self.type_decoder(topic["dtype"], io.BytesIO(payload))
+                "data": data
             }
