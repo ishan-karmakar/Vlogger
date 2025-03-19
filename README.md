@@ -58,3 +58,6 @@ with vlogger.get_source("my_log.wpilog", [""]) as wpilog, \
 
 ## Notes
 Vlogger uses the `logging` library internally to log information about the sources, but by design does not configure the logger at all. This means that program that uses Vlogger has the responsibility of setting up the logger.
+
+## Contributing
+Contributions are always welcome, especially tasks like adding new sources or fixing bugs. If you are making a big change, please create an issue beforehand to come up with a plan before finishing the code.
