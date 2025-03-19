@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frc-vlogger"
+license = { text = "Apache-2.0" }
+description = "FRC post match + live match logging reader abstraction"
+version = "1.1.2"
+authors = [
+    { name = "Ishan Karmakar", email = "ishan.karmakar24@gmail.com" },
+    { name = "Thomas Godden", email = "thomas.godden@outlook.com" }
+]
+readme = "README.md"
+keywords = ["frc", "parser", "networktables", "networktables", "wpilog", "hoot", "ctre"]
+dependencies = ["protobuf"]
+requires-python = ">=3.7"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License"
+]
+
+[project.optional-dependencies]
+live = [
+    "msgpack",
+    "websockets"
+]
+
+[project.urls]
+Repository = "https://git.valor6800.com/valor6800/vlogger"
+Issues = "https://git.valor6800.com/valor6800/vlogger/-/issues"
+Changelog = "https://git.valor6800.com/valor6800/vlogger/-/blob/main/CHANGELOG.md"

@@ -1,93 +1,63 @@
-# Valor Dashboard
+# FRC Vlogger
+## What is this?
+Vlogger is a generic library that provides an abstraction over the various kinds of files and live sources that are used in FRC.  
+This package is developed and used by FRC Valor 6800 for post match analysis.
 
+## Supported Sources
+- [x] [WPILog](https://github.com/wpilibsuite/allwpilib/blob/main/wpiutil/doc/datalog.adoc) (supports structs and protobufs)
+- [x] [NetworkTables4](https://github.com/wpilibsuite/allwpilib/blob/main/ntcore/doc/networktables4.adoc) (supports structs and protobufs)
+- [x] [CTRE Hoot](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/api-usage/signal-logging.html) (file format does not support custom types)
+- [ ] DSLog/DSEvents, unlikely to be added soon
+- [ ] Phoenix Diagnostic Server
 
+## Motivation
+Clients usually just care about the "meat" of the source (that is, the field name, the value, and the timestamp). It usually does not matter to the client where the data came from (i.e. the logic is the same whether it is from a live source or from a log file), and this means that every source should be exposed in a single API that should be a drop in replacement.  
+Additionally, there is no ready to use package in Python to parse WPILog files or connect to NetworkTables4 servers.  
+This package was heavily inspired by [AdvantageScope](https://github.com/Mechanical-Advantage/AdvantageScope)'s [dataSources](https://github.com/Mechanical-Advantage/AdvantageScope/tree/main/src/hub/dataSources) folder code.
 
-## Getting started
+## API Structure
+Each source is initialized with:
+- A reference to the "connection"
+    - For historical logs (i.e. from a log file), this will usually be the path of the log file
+    - For live sources (i.e. connecting to a server), this will usually be the hostname of the target machine
+- A list of regexes to match the regexes against. This was a design choice made to improve performance by only parsing fields that are going to be used. While not recommended, a regex of `""` can be used to match all fields.
+- Any additional arguments that are required for that specific source. This may be for additional configuration or outside executables (the hoot source uses this) to properly parse the file
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Examples
+### Initializing a generic source
+If the file/connection source is not known, it is recommended to use the `get_source` function to iterate through the sources and performing validation on each.
+```python
+import vlogger
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
+# "" regex matches with anything, i.e. any field
+with vlogger.get_source("my_log.wpilog", [""]) as source:
+    for field in source:
+        print(field)
 ```
-cd existing_repo
-git remote add origin https://git.valor6800.com/valor6800/dashboard.git
-git branch -M main
-git push -uf origin main
+
+### Initializing a specific source
+If the file/connection source is known, it may be faster and more readable to explicitly initialize the specific source. This example uses the Hoot source, which requires a reference to the [owlet](https://docs.ctr-electronics.com/cli-tools.html) executable (if not found in `PATH`).
+```python
+from vlogger.sources.wpilog import Hoot
+
+with Hoot("my_log.hoot", ["^MyTargetFields$"], owlet="../my-owlet") as hoot:
+    for field in hoot:
+        print(field)
 ```
 
-## Integrate with your tools
+### Merging sources
+Vlogger has the ability to merge multiple sources into one iterable that will be parsed in chronological order. While it has been tested, keep in mind that some sources such as WPILog and even NT4 have been found to itself be store/give data in a non-chronological order. While it has a very low error rate, it is still something to keep in mind when using this feature.
+```python
+import vlogger
 
-- [ ] [Set up project integrations](https://git.valor6800.com/valor6800/dashboard/-/settings/integrations)
+with vlogger.get_source("my_log.wpilog", [""]) as wpilog, \
+     vlogger.get_source("my_log.hoot", [""]) as hoot:
+    for field in vlogger.merge_sources(wpilog, hoot):
+        print(field)
+```
 
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## Notes
+Vlogger uses the `logging` library internally to log information about the sources, but by design does not configure the logger at all. This means that program that uses Vlogger has the responsibility of setting up the logger.
 
 ## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Contributions are always welcome, especially tasks like adding new sources or fixing bugs. If you are making a big change, please create an issue beforehand to come up with a plan before finishing the code.
