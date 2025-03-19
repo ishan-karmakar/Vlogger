@@ -3,8 +3,8 @@ import logging, os, tempfile
 import shutil
 logger = logging.getLogger(__name__)
 
-class Hoot(Source):
-    def __init__(self, file, regex_listeners, **kwargs):
+class Hoot(wpilog.WPILog):
+    def __init__(self, file, regexes, **kwargs):
         if not file.endswith(".hoot"):
             raise ValueError("File does not end in .hoot")
 
@@ -18,11 +18,8 @@ class Hoot(Source):
         out = os.path.join(self.tempdir, "hoot.wpilog")
         os.system(f"{owlet} {file} {out} -f wpilog")
 
-        self.wpilog = wpilog.WPILog(out, regex_listeners, **kwargs)
+        super(Hoot, self).__init__(out, regexes, **kwargs)
 
-    def __iter__(self):
-        return iter(self.wpilog)
-    
-    def close(self):
-        self.wpilog.close()
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        super(Hoot, self).__exit__(exception_type, exception_value, exception_traceback)
         shutil.rmtree(self.tempdir)

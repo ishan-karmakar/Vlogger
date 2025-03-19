@@ -6,9 +6,5 @@ class Source(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def close(self):
-        raise NotImplementedError
-    
-    @abc.abstractmethod
-    def __iter__(self):
+    def __exit__(self, exception_type, exception_value, exception_traceback):
         raise NotImplementedError

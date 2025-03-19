@@ -37,6 +37,7 @@ class TypeDecoder:
         elif dtype == "double": return struct.unpack("<d", TypeDecoder._attempt_read(data, 8))[0]
         elif dtype == "string": return data.read().decode()
         elif dtype == "json": return json.load(data) # BytesIO counts as file I/O object
+        elif dtype == "structschema": return self("string", data) # Return raw schema as a string
         elif dtype == "string[]":
             arr_len = int.from_bytes(TypeDecoder._attempt_read(data, 4), byteorder="little")
             arr = []

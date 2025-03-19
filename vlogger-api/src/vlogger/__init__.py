@@ -12,13 +12,15 @@ SOURCES = [
     nt4.NetworkTables4
 ]
 
-def get_source(path: str, listeners: dict, **kwargs) -> Source:
+def get_source(path: str, listeners: list, **kwargs) -> Source:
     for Source in SOURCES:
         try:
             return Source(path, listeners, **kwargs)
         except Exception as e:
             logging.debug(f"Source {Source.__name__} skipped, encountered error '{e}'")
-    return None
+
+    # TODO: Find a real built in exception class or create new one SourceNotFound
+    raise Exception("Source not found")
 
 def merge_sources(*sources):
     sources_queue = { iter(source): None for source in sources }
@@ -35,7 +37,7 @@ def merge_sources(*sources):
         but in testing the WPILog + NT4 itself sometimes is not entirely in order (very low error rate but still there),
         so something to keep in mind when processing a large number of fields
         '''
-        min_it = min(sources_queue, key=lambda v: sources_queue.get(v)[3])
+        min_it = min(sources_queue, key=lambda v: sources_queue.get(v)["timestamp"])
         field_data = sources_queue[min_it]
         yield field_data
 

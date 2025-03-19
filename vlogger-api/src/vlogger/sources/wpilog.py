@@ -3,34 +3,37 @@ from vlogger.sources import Source
 from vlogger.sources.types import TypeDecoder
 import os, io, re
 logger = logging.getLogger(__name__)
-SCHEMA_PREFIX = "NT:/.schema"
-STRUCT_PREFIX = SCHEMA_PREFIX + "/struct:"
-PROTO_PREFIX = SCHEMA_PREFIX + "/proto:"
+STRUCT_DTYPE_PREFIX = "struct:"
+PROTO_DTYPE_PREFIX = "proto:"
+SCHEMA_NT_PREFIX = "NT:/.schema/"
+STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
+PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
 
 class WPILog(Source):
-    def __init__(self, file, regex_listeners, **kwargs):
-        # Map of regex -> listeners
-        self.regex_listeners = regex_listeners.copy()
-        # Add a dummy regex for all schemas
-        self.regex_listeners[re.compile(f"^{re.escape("NT:/.schema/")}")] = set()
-        # Map of actual field ids -> listeners + data, will be populated when start records come
-        self.field_map = {}
-        self.type_decoder = TypeDecoder()
-
-        if not file:
-            raise FileNotFoundError
+    def __init__(self, file, regexes: list, **kwargs):
         self.file = open(file, "rb")
         if self.file.read(6) != b"WPILOG":
             raise ValueError("WPILog signature not found when parsing file")
 
-    def close(self):
+        # Map of regexes that are used by the client
+        self.regexes = [re.compile(r) for r in regexes]
+        # Map of regexes that are used internally, may overlap with self.regexes
+        self.internal_regexes = [re.compile(f"^{re.escape("NT:/.schema/")}")]
+        # Map of actual field ids -> listeners + data, will be populated when start records come
+        self.field_map = {}
+        self.type_decoder = TypeDecoder()
+
+    def __enter__(self):
+        # File is already opened in __init__
+        return self
+
+    def __exit__(self, exception_type, exception_value, exception_traceback):
         self.file.close()
-    
+
     def __iter__(self):
         self._parse_header()
         return self
-
-    # Returns [regex array that got mapped, listener array, field name, timestamp, data]
+    
     def __next__(self):
         while True:
             ret = self._parse_record()
@@ -81,17 +84,24 @@ class WPILog(Source):
                 raise Exception
 
             # Loop through all target fields and test against target regex
-            for regex, listeners in self.regex_listeners.items():
+            for regex in self.regexes:
                 if regex.match(entry_name):
                     if entry_id in self.field_map:
-                        self.field_map[entry_id]["listeners"] |= listeners
-                        self.field_map[entry_id]["regex"].add(regex)
+                        self.field_map[entry_id]["regexes"].add(regex)
                     else:
                         self.field_map[entry_id] = {
                             "name": entry_name,
                             "dtype": entry_type,
-                            "listeners": listeners,
-                            "regex": { regex }
+                            "regexes": { regex}
+                        }
+            
+            for regex in self.internal_regexes:
+                if regex.match(entry_name):
+                    if not entry_id in self.field_map:
+                        self.field_map[entry_id] = {
+                            "name": entry_name,
+                            "dtype": entry_type,
+                            "regexes": set()
                         }
         elif control_type == 1:
             metadata_length = int.from_bytes(self.file.read(4), "little")
@@ -106,9 +116,14 @@ class WPILog(Source):
 
         topic = self.field_map[id]
         payload = self.file.read(payload_size)
-        if topic["name"].startswith(STRUCT_PREFIX):
-            self.type_decoder.add_struct("struct:" + topic["name"].removeprefix(STRUCT_PREFIX), payload.decode())
-        elif topic["name"].startswith(PROTO_PREFIX):
+        if topic["name"].startswith(STRUCT_NT_PREFIX):
+            self.type_decoder.add_struct(STRUCT_DTYPE_PREFIX + topic["name"].removeprefix(STRUCT_NT_PREFIX), payload.decode())
+        elif topic["name"].startswith(PROTO_NT_PREFIX):
             self.type_decoder.add_proto(payload)
-        else:
-            return (topic["regex"], topic["listeners"], topic["name"], timestamp, self.type_decoder(topic["dtype"], io.BytesIO(payload)))
+        if len(topic["regexes"]):
+            return {
+                "regexes": topic["regexes"],
+                "name": topic["name"],
+                "timestamp": timestamp,
+                "data": self.type_decoder(topic["dtype"], io.BytesIO(payload))
+            }
