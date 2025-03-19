@@ -6,20 +6,20 @@ build-backend = "setuptools.build_meta"
 name = "frc-vlogger"
 license = { text = "Apache-2.0" }
 description = "FRC post match + live match logging reader abstraction"
-version = "1.0.3"
+version = "1.1.1"
 authors = [
     { name = "Ishan Karmakar", email = "ishan.karmakar24@gmail.com" },
     { name = "Thomas Godden", email = "thomas.godden@outlook.com" }
 ]
+readme = "README.md"
 keywords = ["frc", "parser", "networktables", "networktables", "wpilog", "hoot", "ctre"]
 dependencies = ["protobuf"]
-requires-python = ">=3.6"
+requires-python = ">=3.7"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.6",
     "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
