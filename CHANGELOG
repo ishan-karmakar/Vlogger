@@ -1,3 +1,8 @@
+# 1.2.0
+Release Date: 03/20/2025
+* Type decoder now returns the created type for fields with `structschema` data types
+* Fixed deprecated warnings for license in `pyproject.toml`
+
 # 1.1.2
 Release Date: 03/19/2025
 * Remove debugging print statement in `TypeDecoder` that was causing a massive slowdown and clogging up the console
