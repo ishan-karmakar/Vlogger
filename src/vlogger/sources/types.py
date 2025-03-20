@@ -23,13 +23,13 @@ class TypeDecoder:
         elif dtype == "string": return data.read().decode()
         elif dtype == "json": return json.load(data) # BytesIO counts as file I/O object
         elif dtype == "structschema":
-            string = self({
+            schema = self({
                 "name": name,
                 "dtype": "string"
             }, data)
             dtype = STRUCT_DTYPE_PREFIX + "".join(name.split(STRUCT_DTYPE_PREFIX)[1:])
             logger.debug(f"Registered {dtype} in internal struct map")
-            fields = [f.split(" ") for f in string.split(";")]
+            fields = [f.split(" ") for f in schema.split(";")]
             for i, field in enumerate(fields):
                 fields[i][0] = "struct:" + field[0] if "struct:" + field[0] in self.struct_map else field[0]
 
@@ -39,10 +39,11 @@ class TypeDecoder:
                         "name": name,
                         "dtype": field[0]
                     }, data)
-            self.struct_map[dtype] = type(dtype, (object,), {
+            new_type = type(dtype, (object,), {
                 "__init__": __init__
             })
-            return string
+            self.struct_map[dtype] = new_type
+            return new_type
         elif dtype == PROTO_DTYPE_PREFIX + "FileDescriptorProto":
             desc = self.proto_pool.AddSerializedFile(data.read())
             for k in desc.message_types_by_name.keys() + desc.enum_types_by_name.keys() + desc.extensions_by_name.keys() + desc.services_by_name.keys():
