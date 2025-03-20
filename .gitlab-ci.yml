@@ -30,8 +30,8 @@ deploy:
   script:
     - python -m pip install build twine
     - python -m build
-    - python -m twine upload --skip-existing dist/*
-  environment: production
+    - python -m twine upload dist/*
+  environment: deploy
   artifacts:
     paths:
       - dist/*
