@@ -39,4 +39,4 @@ live = [
 [project.urls]
 Repository = "https://git.valor6800.com/valor6800/vlogger"
 Issues = "https://git.valor6800.com/valor6800/vlogger/-/issues"
-Changelog = "https://git.valor6800.com/valor6800/vlogger/-/blob/main/CHANGELOG.md"
+Changelog = "https://git.valor6800.com/valor6800/vlogger/-/blob/main/CHANGELOG"
