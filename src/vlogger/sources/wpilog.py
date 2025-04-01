@@ -35,6 +35,12 @@ class WPILog(Source):
         self._parse_header()
         return self
     
+    def __len__(self):
+        i = 0
+        for field in self:
+            i += 1
+        return i
+
     def __next__(self):
         while True:
             ret = self._parse_record()
