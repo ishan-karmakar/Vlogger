@@ -91,12 +91,6 @@ class WPILog(Source):
             if entry_name_length == 0:
                 raise Exception
 
-            entry_name = entry_name[3:] # Remove NT:
-            if not entry_name.startswith("/"):
-                entry_name = "/" + entry_name
-
-            entry_name = "NT:" + entry_name
-
             # Loop through all target fields and test against target regex
             for regex in self.regexes:
                 if regex.match(entry_name):
