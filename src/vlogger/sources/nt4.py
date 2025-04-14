@@ -135,24 +135,23 @@ class NetworkTables4(Source):
             id = msg["params"]["id"]
             name = msg["params"]["name"]
             sub_fields = set()
-            normalized_name = "NT:/" + name.removeprefix("/")
             for regex in self.regexes:
-                if regex.match(normalized_name):
+                if regex.match(name):
                     sub_fields.add(name)
                     if id in self.field_map:
                         self.field_map[id]["regex"].add(regex)
                     else:
                         self.field_map[id] = {
-                            "name": normalized_name,
+                            "name": name,
                             "dtype": msg["params"]["type"],
                             "regex": { regex }
                         }
             for regex in self.internal_regexes:
-                if regex.match(normalized_name):
+                if regex.match(name):
                     sub_fields.add(name)
                     if not id in self.field_map:
                         self.field_map[id] = {
-                            "name": normalized_name,
+                            "name": name,
                             "dtype": msg["params"]["type"],
                             "regex": set()
                         }
