@@ -9,7 +9,7 @@ SCHEMA_NT_PREFIX = "NT:/.schema/"
 STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
 PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
 
-class WPILog(Source):
+class WPILog(Source):    
     def __init__(self, file, regexes: list, **kwargs):
         self.file = open(file, "rb")
         if self.file.read(6) != b"WPILOG":
@@ -22,6 +22,7 @@ class WPILog(Source):
         # Map of actual field ids -> listeners + data, will be populated when start records come
         self.field_map = {}
         self.type_decoder = TypeDecoder()
+        self.bitfield = 0
 
     def __enter__(self):
         # File is already opened in __init__
@@ -62,6 +63,7 @@ class WPILog(Source):
             raise StopIteration
         
         header_bitfield = int.from_bytes(bitfield, "little")
+        self.bitfield = header_bitfield
         entry_id_length = (header_bitfield & 0b11) + 1
         payload_size_length = ((header_bitfield >> 2) & 0b11) + 1
         timestamp_length = ((header_bitfield >> 4) & 0b111) + 1
@@ -71,11 +73,11 @@ class WPILog(Source):
         timestamp = int.from_bytes(self.file.read(timestamp_length), "little")
 
         if id == 0:
-            self._parse_control()
+            self._parse_control(payload_size)
         else:
             return self._parse_data(id, payload_size, timestamp)
     
-    def _parse_control(self):
+    def _parse_control(self, payload_size):
         control_type = int.from_bytes(self.file.read(1), "little")
         entry_id = int.from_bytes(self.file.read(4), "little")
 
@@ -102,7 +104,7 @@ class WPILog(Source):
                             "dtype": entry_type,
                             "regexes": { regex}
                         }
-            
+
             for regex in self.internal_regexes:
                 if regex.match(entry_name):
                     if not entry_id in self.field_map:
@@ -112,16 +114,18 @@ class WPILog(Source):
                             "regexes": set()
                         }
         elif control_type == 1:
-            metadata_length = int.from_bytes(self.file.read(4), "little")
-            self.file.seek(metadata_length, os.SEEK_CUR)
+            self.file.seek(payload_size - 5, os.SEEK_CUR)
+
         elif control_type == 2:
             self.field_map.pop(entry_id, None)
 
     def _parse_data(self, id, payload_size, timestamp):
+        
         if not id in self.field_map:
             self.file.seek(payload_size, os.SEEK_CUR)
             return
-
+        
+        
         topic = self.field_map[id]
         payload = self.file.read(payload_size)
         data = self.type_decoder(topic, io.BytesIO(payload))
