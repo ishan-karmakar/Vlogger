@@ -1,5 +1,4 @@
-from vlogger.sources import Source
-from vlogger.sources.types import TypeDecoder
+from vlogger.types import TypeDecoder
 import json, logging, re, io, threading, queue
 import socket
 logger = logging.getLogger(__name__)
@@ -10,7 +9,7 @@ SCHEMA_NT_PREFIX = "NT:/.schema/"
 STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
 PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
 
-class NetworkTables4(Source):
+class NetworkTables4:
     def __init__(self, hostname, regexes, **kwargs):
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # Will raise ConnectionRefusedError if can't connect
@@ -19,7 +18,7 @@ class NetworkTables4(Source):
         client_socket.close()
 
         self.hostname = hostname
-        self.regexes = [re.compile(r) for r in regexes]
+        self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
         self.internal_regexes = [re.compile("^" + re.escape("NT:/.schema/"))]
         self.cur_subuid = 0
         self.queue = queue.SimpleQueue()
