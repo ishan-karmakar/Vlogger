@@ -1,6 +1,5 @@
 import logging
-from vlogger.sources import Source
-from vlogger.sources.types import TypeDecoder
+from vlogger.types import TypeDecoder
 import os, io, re
 logger = logging.getLogger(__name__)
 STRUCT_DTYPE_PREFIX = "struct:"
@@ -9,20 +8,19 @@ SCHEMA_NT_PREFIX = "NT:/.schema/"
 STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
 PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
 
-class WPILog(Source):    
+class WPILog:    
     def __init__(self, file, regexes: list, **kwargs):
         self.file = open(file, "rb")
         if self.file.read(6) != b"WPILOG":
             raise ValueError("WPILog signature not found when parsing file")
 
         # Map of regexes that are used by the client
-        self.regexes = [re.compile(r) for r in regexes]
+        self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
         # Map of regexes that are used internally, may overlap with self.regexes
         self.internal_regexes = [re.compile("^" + re.escape("NT:/.schema/"))]
         # Map of actual field ids -> listeners + data, will be populated when start records come
         self.field_map = {}
         self.type_decoder = TypeDecoder()
-        self.bitfield = 0
 
     def __enter__(self):
         # File is already opened in __init__
@@ -63,7 +61,6 @@ class WPILog(Source):
             raise StopIteration
         
         header_bitfield = int.from_bytes(bitfield, "little")
-        self.bitfield = header_bitfield
         entry_id_length = (header_bitfield & 0b11) + 1
         payload_size_length = ((header_bitfield >> 2) & 0b11) + 1
         timestamp_length = ((header_bitfield >> 4) & 0b111) + 1

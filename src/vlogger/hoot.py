@@ -1,4 +1,4 @@
-from vlogger.sources import Source, wpilog
+from vlogger import wpilog
 import logging, os, tempfile
 import shutil
 logger = logging.getLogger(__name__)

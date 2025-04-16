@@ -1,5 +1,4 @@
-from vlogger.sources import Source
-from vlogger.sources import nt4, wpilog, hoot
+from vlogger import nt4, wpilog, hoot
 import logging
 
 SOURCES = [
@@ -12,7 +11,7 @@ SOURCES = [
     nt4.NetworkTables4
 ]
 
-def get_source(path: str, listeners: list, **kwargs) -> Source:
+def get_source(path: str, listeners: list, **kwargs):
     for Source in SOURCES:
         try:
             return Source(path, listeners, **kwargs)
