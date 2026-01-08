@@ -1,27 +1,27 @@
-import logging
 from urllib.parse import ParseResult
 from vlogger.types import BaseSource, TypeDecoder
-import os, io, re
-import wpiutil.log
+import io, re
+from wpiutil.log import DataLogRecord, DataLogReader
 
-logger = logging.getLogger(__name__)
-STRUCT_DTYPE_PREFIX = "struct:"
-PROTO_DTYPE_PREFIX = "proto:"
-SCHEMA_NT_PREFIX = "NT:/.schema/"
-STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
-PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
+GETTERS = {
+    "boolean": [DataLogRecord.getBoolean, DataLogRecord.getBooleanArray],
+    "float": [DataLogRecord.getFloat, DataLogRecord.getFloatArray],
+    "double": [DataLogRecord.getDouble, DataLogRecord.getDoubleArray],
+    "int64": [DataLogRecord.getInteger, DataLogRecord.getIntegerArray],
+    "string": [DataLogRecord.getString, DataLogRecord.getStringArray],
+}
 
 class WPILog(BaseSource):
     SCHEME = "wpilog"
 
     def __init__(self, ident: ParseResult, regexes: list, **kwargs):
-        self.ident = ident
         self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
         self.field_map = {}
         self.type_decoder = TypeDecoder()
+        self.log = DataLogReader(ident.path.lstrip('/'))
     
     def __enter__(self):
-        self.log = wpiutil.log.DataLogReader(self.ident.path.lstrip('/'))
+        pass
     
     def __exit__(self, exception_type, exception_value, exception_traceback):
         pass
@@ -35,7 +35,10 @@ class WPILog(BaseSource):
             else:
                 entry_id = record.getEntry()
                 if entry_id in self.field_map:
-                    data = self._parse_data(record)
+                    if self.field_map[entry_id]["getter"]:
+                        data = self.field_map[entry_id]["getter"](record)
+                    else:
+                        data = self.type_decoder(self.field_map[entry_id], io.BytesIO(record.getRaw()))
                     if self.field_map[entry_id]["public"]:
                         yield {
                             "timestamp": record.getTimestamp(),
@@ -43,33 +46,24 @@ class WPILog(BaseSource):
                             "name": self.field_map[entry_id]["name"]
                         }
 
-    def _parse_data(self, record: wpiutil.log.DataLogRecord):
-        match self.field_map[record.getEntry()]["dtype"]:
-            case "boolean": return record.getBoolean()
-            case "int64": return record.getInteger()
-            case "float": return record.getFloat()
-            case "double": return record.getDouble()
-            case "string": return record.getString()
-            case "boolean[]": return record.getBooleanArray()
-            case "int64[]": return record.getIntegerArray()
-            case "float[]": return record.getFloatArray()
-            case "double[]": return record.getDoubleArray()
-            case "string[]": return record.getStringArray()
-            case _: return self.type_decoder(self.field_map[record.getEntry()], io.BytesIO(record.getRaw()))
-
-    def _parse_start(self, record: wpiutil.log.DataLogRecord):
+    def _parse_start(self, record: DataLogRecord):
         data = record.getStartData()
+        public: bool | None = None
         if data.type == "structschema":
-            self.field_map[data.entry] = {
-                "name": data.name,
-                "dtype": data.type,
-                "public": False
-            }
+            public = False
         for regex in self.regexes:
             if regex.search(data.name):
-                self.field_map.setdefault(data.entry, {
-                    "name": data.name,
-                    "dtype": data.type,
-                    "public": True
-                })
+                public = True
                 break
+        if public is not None:
+            getter = GETTERS.get(data.type.rstrip("[]"))
+            if getter:
+                [single, array] = getter
+                getter = array if data.type.endswith("[]") else single
+            self.field_map.setdefault(data.entry, {
+                "name": data.name,
+                "dtype": data.type,
+                "getter": getter,
+                "public": public
+            })
+    
