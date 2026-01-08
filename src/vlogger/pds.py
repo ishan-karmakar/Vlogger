@@ -4,7 +4,7 @@ from urllib.parse import SplitResult
 
 import requests
 from vlogger.types import BaseSource
-from urllib.parse import urlunsplit
+from urllib.parse import urlunsplit, urlencode
 
 '''
 /?action=getversion
@@ -19,30 +19,91 @@ PROBABLY NOT USEFUL - /?action=runcaniv&cmd=--version&path=C:%5CUsers%5Cishan%5C
 /?action=getsignals&model=CANCoder%20vers.%20H&id=20&canbus=
 '''
 
+MODEL_CLASS_MAPPING = {
+    "Talon FX": "TalonFX",
+    "CANCoder": "CANcoder"
+}
+
 class PhoenixDiagnosticServer(BaseSource):
     SCHEME = "pds"
 
     def __init__(self, ident: SplitResult, regexes):
         self.netloc = f"{ident.hostname or "localhost"}:{ident.port or 1250}"
         self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
+        self.session = requests.Session()
+        self.device_map: dict[int, dict] = {}
+        self.device_signals: dict[int, list[int]] = {}
+        self.signal_map = {}
 
     def __enter__(self):
         return self
     
     def __iter__(self):
         # TODO: Bus util percentage
-        version = self._run_query("action=getversion")
+        yield from self._get_version()
+        self._get_common_signals()
+        yield from self._get_devices()
+
+        streams = { id: self._plot_device(id) for id in self.device_signals }
+
+        while True:
+            for id, stream in streams.items():
+                point = next(stream)
+                for code, data in point["Signals"].items():
+                    yield {
+                        "timestamp": point["Timestamp"],
+                        "name": f"ID {id}/{self.signal_map[int(code)]}",
+                        "data": data
+                    }
+
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        pass
+
+    def _get_version(self):
+        version = self._run_query({ "action": "getversion" })
         for k in ["ReleaseInfo", "Version"]:
             yield from self._return_oneshot(f"Server/{k}", version[k])
-        devices = self._run_query("action=getdevices")["DeviceArray"]
+
+    def _get_devices(self):
+        devices = self._run_query({ "action": "getdevices" })["DeviceArray"]
         for device in devices:
             for k, v in device.items():
                 if k == "ID":
                     continue
                 yield from self._return_oneshot(f"ID {device["ID"]}/{k}", v)
 
-    def __exit__(self, exception_type, exception_value, exception_traceback):
-        pass
+            self.device_map[device["ID"]] = device
+            class_name = device["Model"].split("vers.")[0].strip()
+            class_name = MODEL_CLASS_MAPPING.get(class_name, class_name)
+            signals = self._run_query({ "action": "getsignals", "model": device["Model"], "id": device["ID"] })["Signals"]
+            signals = { x["Id"]: x["Name"] for x in signals }
+            if class_name in MODEL_CLASS_MAPPING:
+                signals = self.common_signals[class_name] | signals
+            for code, signal in signals.items():
+                for regex in self.regexes:
+                    if regex.search(f"ID {device["ID"]}/{signal}"):
+                        self.device_signals.setdefault(device["ID"], [])
+                        self.device_signals[device["ID"]].append(code)
+                        self.signal_map[code] = signal
+                        break
+
+    def _get_common_signals(self):
+        body = self._run_query({ "action": "getcommonsignals" })["Signals"]
+        for k, v in body.items():
+            body[k] = { x["Id"]: x["Name"] for x in v }
+        self.common_signals = body
+
+    def _plot_device(self, id):
+        while True:
+            response = self._run_query({
+                "action": "plotpro",
+                "model": self.device_map[id]["Model"],
+                "id": id,
+                "signals": ",".join(map(str, self.device_signals[id])),
+                "resolution": 50
+            })
+            for point in response["Points"]:
+                yield point
 
     def _return_oneshot(self, name: str, data):
         for regex in self.regexes:
@@ -50,13 +111,5 @@ class PhoenixDiagnosticServer(BaseSource):
                 yield { "name": name, "data": data }
                 break
 
-    def _get_devices(self) -> dict[str, int]:
-        response = self._run_query("action=getdevices")
-        pprint(response)
-
-    def _get_common_signals(self) -> dict[str, int]:
-        response = self._run_query("action=getcommonsignals")
-        pprint(response["Signals"])
-
-    def _run_query(self, query: str):
-        return requests.get(urlunsplit(("http", self.netloc, "", query, ""))).json()
+    def _run_query(self, query: dict):
+        return self.session.get(urlunsplit(("http", self.netloc, "", urlencode(query), "")), timeout=10).json()
