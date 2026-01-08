@@ -1,10 +1,11 @@
+from urllib.parse import SplitResult
 from vlogger.types import BaseSource, TypeDecoder
-import re, io, queue, urllib.parse, ntcore
+import re, io, queue, ntcore
 
 class NetworkTables4(BaseSource):
     SCHEME = "nt4"
 
-    def __init__(self, ident: urllib.parse.ParseResult, regexes, **kwargs):
+    def __init__(self, ident: SplitResult, regexes):
         self.ident = ident
         self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
         self.queue = queue.SimpleQueue()
@@ -15,6 +16,7 @@ class NetworkTables4(BaseSource):
         ntcore.NetworkTableInstance.getDefault().setServer(self.ident.hostname or "localhost", self.ident.port or 0)
         ntcore.NetworkTableInstance.getDefault().addListener([""], ntcore.EventFlags.kPublish, self._topic_listener)
         ntcore.NetworkTableInstance.getDefault().addListener(["/.schema/struct:"], ntcore.EventFlags.kValueRemote, self._add_structschema)
+        return self
 
     def __iter__(self):
         return self

@@ -1,6 +1,7 @@
 .vscode/
 
 # Just for convenience
+test.py
 *.wpilog
 *.hoot
 

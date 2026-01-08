@@ -1,13 +1,13 @@
 from vlogger import wpilog
 import logging, os, tempfile
 import shutil
-from urllib.parse import ParseResult, urlparse
+from urllib.parse import SplitResult, urlsplit
 logger = logging.getLogger(__name__)
 
 class Hoot(wpilog.WPILog):
     SCHEME = "hoot"
 
-    def __init__(self, ident: ParseResult, regexes, **kwargs):
+    def __init__(self, ident: SplitResult, regexes, **kwargs):
         owlet = shutil.which(kwargs.get("owlet", "owlet"))
         if owlet:
             logger.debug(f"Using owlet at {owlet}")
@@ -18,7 +18,7 @@ class Hoot(wpilog.WPILog):
         out = os.path.join(self.tempdir, "hoot.wpilog")
         os.system(f"{owlet} {ident.path.lstrip('/')} {out} -f wpilog")
 
-        super(Hoot, self).__init__(urlparse(f"wpilog:///{out}"), regexes, **kwargs)
+        super(Hoot, self).__init__(urlsplit(f"wpilog:///{out}"), regexes, **kwargs)
 
     def __exit__(self, exception_type, exception_value, exception_traceback):
         super(Hoot, self).__exit__(exception_type, exception_value, exception_traceback)

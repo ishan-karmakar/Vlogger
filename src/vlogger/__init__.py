@@ -1,4 +1,4 @@
-from vlogger import nt4, wpilog, hoot
+from vlogger import nt4, wpilog, hoot, pds
 import urllib.parse
 
 from vlogger.types import BaseSource
@@ -6,11 +6,12 @@ from vlogger.types import BaseSource
 SOURCES: list[type[BaseSource]] = [
     hoot.Hoot,
     wpilog.WPILog,
-    nt4.NetworkTables4
+    nt4.NetworkTables4,
+    pds.PhoenixDiagnosticServer
 ]
 
 def get_source(ident: str, listeners: list, **kwargs):
-    url = urllib.parse.urlparse(ident)
+    url = urllib.parse.urlsplit(ident)
     for Source in SOURCES:
         if Source.SCHEME == url.scheme:
             return Source(url, listeners, **kwargs)
