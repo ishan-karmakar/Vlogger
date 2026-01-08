@@ -16,7 +16,7 @@ class Hoot(wpilog.WPILog):
 
         self.tempdir = tempfile.mkdtemp()
         out = os.path.join(self.tempdir, "hoot.wpilog")
-        os.system(f"{owlet} {ident.path} {out} -f wpilog")
+        os.system(f"{owlet} {ident.path.lstrip('/')} {out} -f wpilog")
 
         super(Hoot, self).__init__(urlparse(f"wpilog:///{out}"), regexes, **kwargs)
 
