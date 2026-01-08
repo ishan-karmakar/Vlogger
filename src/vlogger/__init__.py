@@ -1,8 +1,9 @@
 from vlogger import nt4, wpilog, hoot
-import logging
 import urllib.parse
 
-SOURCES = [
+from vlogger.types import BaseSource
+
+SOURCES: list[type[BaseSource]] = [
     hoot.Hoot,
     wpilog.WPILog,
     nt4.NetworkTables4
@@ -11,10 +12,8 @@ SOURCES = [
 def get_source(ident: str, listeners: list, **kwargs):
     url = urllib.parse.urlparse(ident)
     for Source in SOURCES:
-        try:
+        if Source.SCHEME == url.scheme:
             return Source(url, listeners, **kwargs)
-        except TypeError:
-            pass
 
     # TODO: Find a real built in exception class or create new one SourceNotFound
     raise Exception("Source not found")

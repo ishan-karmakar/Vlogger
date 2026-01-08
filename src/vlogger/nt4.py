@@ -1,4 +1,4 @@
-from vlogger.types import TypeDecoder
+from vlogger.types import BaseSource, TypeDecoder
 import json, logging, re, io, threading, queue
 import socket, urllib.parse
 logger = logging.getLogger(__name__)
@@ -9,10 +9,10 @@ SCHEMA_NT_PREFIX = "NT:/.schema/"
 STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
 PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
 
-class NetworkTables4:
+class NetworkTables4(BaseSource):
+    SCHEME = "nt4"
+
     def __init__(self, ident: urllib.parse.ParseResult, regexes, **kwargs):
-        if ident.scheme != "nt4":
-            raise TypeError("Not an NT4 URL")
         self.ident = ident
         self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
         self.internal_regexes = [re.compile("^" + re.escape("NT:/.schema/"))]
