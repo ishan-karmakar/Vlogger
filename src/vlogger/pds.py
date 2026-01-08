@@ -32,7 +32,6 @@ class PhoenixDiagnosticServer(BaseSource):
         self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
         self.session = requests.Session()
         self.device_map: dict[int, dict] = {}
-        self.device_signals: dict[int, list[int]] = {}
         self.signal_map = {}
 
     def __enter__(self):
@@ -44,7 +43,9 @@ class PhoenixDiagnosticServer(BaseSource):
         self._get_common_signals()
         yield from self._get_devices()
 
-        streams = { id: self._plot_device(id) for id in self.device_signals }
+        yield { "name": "Server/OneshotDataFinished" }
+
+        streams = { id: self._plot_device(id) for id in self.device_map }
 
         while True:
             for id, stream in streams.items():
@@ -72,7 +73,6 @@ class PhoenixDiagnosticServer(BaseSource):
                     continue
                 yield from self._return_oneshot(f"ID {device["ID"]}/{k}", v)
 
-            self.device_map[device["ID"]] = device
             class_name = device["Model"].split("vers.")[0].strip()
             class_name = MODEL_CLASS_MAPPING.get(class_name, class_name)
             signals = self._run_query({ "action": "getsignals", "model": device["Model"], "id": device["ID"] })["Signals"]
@@ -82,8 +82,8 @@ class PhoenixDiagnosticServer(BaseSource):
             for code, signal in signals.items():
                 for regex in self.regexes:
                     if regex.search(f"ID {device["ID"]}/{signal}"):
-                        self.device_signals.setdefault(device["ID"], [])
-                        self.device_signals[device["ID"]].append(code)
+                        self.device_map.setdefault(device["ID"], device | { "signals": [] })
+                        self.device_map[device["ID"]]["signals"].append(code)
                         self.signal_map[code] = signal
                         break
 
@@ -99,7 +99,7 @@ class PhoenixDiagnosticServer(BaseSource):
                 "action": "plotpro",
                 "model": self.device_map[id]["Model"],
                 "id": id,
-                "signals": ",".join(map(str, self.device_signals[id])),
+                "signals": ",".join(map(str, self.device_map[id]["signals"])),
                 "resolution": 50
             })
             for point in response["Points"]:
