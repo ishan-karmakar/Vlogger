@@ -1,6 +1,7 @@
 import logging
-from vlogger.types import TypeDecoder
+from vlogger.types import BaseSource, TypeDecoder
 import os, io, re
+import urllib.parse
 logger = logging.getLogger(__name__)
 STRUCT_DTYPE_PREFIX = "struct:"
 PROTO_DTYPE_PREFIX = "proto:"
@@ -8,11 +9,13 @@ SCHEMA_NT_PREFIX = "NT:/.schema/"
 STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
 PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
 
-class WPILog:    
-    def __init__(self, file, regexes: list, **kwargs):
-        self.file = open(file, "rb")
+class WPILog(BaseSource):
+    SCHEME = "wpilog"
+
+    def __init__(self, ident: urllib.parse.ParseResult, regexes: list, **kwargs):
+        self.file = open(ident.path, "rb")
         if self.file.read(6) != b"WPILOG":
-            raise ValueError("WPILog signature not found when parsing file")
+            raise TypeError("WPILog signature not found when parsing file")
 
         # Map of regexes that are used by the client
         self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]

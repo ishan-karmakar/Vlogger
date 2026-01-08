@@ -1,6 +1,6 @@
-from vlogger.types import TypeDecoder
+from vlogger.types import BaseSource, TypeDecoder
 import json, logging, re, io, threading, queue
-import socket
+import socket, urllib.parse
 logger = logging.getLogger(__name__)
 
 STRUCT_DTYPE_PREFIX = "struct:"
@@ -9,15 +9,11 @@ SCHEMA_NT_PREFIX = "NT:/.schema/"
 STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
 PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
 
-class NetworkTables4:
-    def __init__(self, hostname, regexes, **kwargs):
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Will raise ConnectionRefusedError if can't connect
-        # FIXME: Check for signature or equivalent to make sure it is correct live source
-        client_socket.connect((hostname, 5810))
-        client_socket.close()
+class NetworkTables4(BaseSource):
+    SCHEME = "nt4"
 
-        self.hostname = hostname
+    def __init__(self, ident: urllib.parse.ParseResult, regexes, **kwargs):
+        self.ident = ident
         self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
         self.internal_regexes = [re.compile("^" + re.escape("NT:/.schema/"))]
         self.cur_subuid = 0
@@ -35,7 +31,7 @@ class NetworkTables4:
 
     def _init_main(self):
         from websockets.sync import client
-        with client.connect(f"ws://{self.hostname}:5810/nt/vlogger", subprotocols=[client.Subprotocol("v4.1.networktables.first.wpi.edu"), client.Subprotocol("networktables.first.wpi.edu")]) as websocket:
+        with client.connect(f"ws://{self.ident.netloc}/nt/vlogger", subprotocols=[client.Subprotocol("v4.1.networktables.first.wpi.edu"), client.Subprotocol("networktables.first.wpi.edu")]) as websocket:
             logger.info("Successfully connected to NT4 server")
             self.websocket = websocket
             websocket.send(json.dumps([

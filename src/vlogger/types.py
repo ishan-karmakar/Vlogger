@@ -1,4 +1,6 @@
+from abc import abstractmethod
 import logging, struct, io
+from urllib.parse import ParseResult
 from google.protobuf.descriptor_pool import DescriptorPool
 from google.protobuf.message_factory import GetMessageClass
 import json
@@ -85,3 +87,10 @@ class TypeDecoder:
         if len(buf) != size:
             raise EOFError
         return buf
+
+class BaseSource:
+    SCHEME = ""
+
+    @abstractmethod
+    def __init__(self, ident: ParseResult, regexes, **kwargs):
+        raise NotImplementedError
