@@ -2,12 +2,14 @@ import logging
 from vlogger.types import BaseSource, TypeDecoder
 import os, io, re
 import urllib.parse
+
 logger = logging.getLogger(__name__)
 STRUCT_DTYPE_PREFIX = "struct:"
 PROTO_DTYPE_PREFIX = "proto:"
 SCHEMA_NT_PREFIX = "NT:/.schema/"
 STRUCT_NT_PREFIX = SCHEMA_NT_PREFIX + STRUCT_DTYPE_PREFIX
 PROTO_NT_PREFIX = SCHEMA_NT_PREFIX + PROTO_DTYPE_PREFIX
+
 
 class WPILog(BaseSource):
     SCHEME = "wpilog"
@@ -36,7 +38,7 @@ class WPILog(BaseSource):
         # _parse_header seeks to start of file every time, no need to do it here
         self._parse_header()
         return self
-    
+
     def __len__(self):
         i = 0
         for field in self:
@@ -62,7 +64,7 @@ class WPILog(BaseSource):
         bitfield = self.file.read(1)
         if not len(bitfield):
             raise StopIteration
-        
+
         header_bitfield = int.from_bytes(bitfield, "little")
         entry_id_length = (header_bitfield & 0b11) + 1
         payload_size_length = ((header_bitfield >> 2) & 0b11) + 1
@@ -76,7 +78,7 @@ class WPILog(BaseSource):
             self._parse_control(payload_size)
         else:
             return self._parse_data(id, payload_size, timestamp)
-    
+
     def _parse_control(self, payload_size):
         control_type = int.from_bytes(self.file.read(1), "little")
         entry_id = int.from_bytes(self.file.read(4), "little")
@@ -87,7 +89,9 @@ class WPILog(BaseSource):
             entry_type_length = int.from_bytes(self.file.read(4), "little")
             entry_type = self.file.read(entry_type_length).decode()
             entry_metadata_length = int.from_bytes(self.file.read(4), "little")
-            self.file.seek(entry_metadata_length, os.SEEK_CUR) # We don't care about metadata
+            self.file.seek(
+                entry_metadata_length, os.SEEK_CUR
+            )  # We don't care about metadata
 
             logger.debug(f"Found start record for {entry_name}")
             if entry_name_length == 0:
@@ -102,7 +106,7 @@ class WPILog(BaseSource):
                         self.field_map[entry_id] = {
                             "name": entry_name,
                             "dtype": entry_type,
-                            "regexes": { regex}
+                            "regexes": {regex},
                         }
 
             for regex in self.internal_regexes:
@@ -111,7 +115,7 @@ class WPILog(BaseSource):
                         self.field_map[entry_id] = {
                             "name": entry_name,
                             "dtype": entry_type,
-                            "regexes": set()
+                            "regexes": set(),
                         }
         elif control_type == 1:
             self.file.seek(payload_size - 5, os.SEEK_CUR)
@@ -120,12 +124,11 @@ class WPILog(BaseSource):
             self.field_map.pop(entry_id, None)
 
     def _parse_data(self, id, payload_size, timestamp):
-        
+
         if not id in self.field_map:
             self.file.seek(payload_size, os.SEEK_CUR)
             return
-        
-        
+
         topic = self.field_map[id]
         payload = self.file.read(payload_size)
         data = self.type_decoder(topic, io.BytesIO(payload))
@@ -134,5 +137,5 @@ class WPILog(BaseSource):
                 "regexes": topic["regexes"],
                 "name": topic["name"],
                 "timestamp": timestamp,
-                "data": data
+                "data": data,
             }
