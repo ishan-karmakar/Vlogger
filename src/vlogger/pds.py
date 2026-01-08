@@ -31,6 +31,9 @@ class PhoenixDiagnosticServer(BaseSource):
     
     def __iter__(self):
         # TODO: Bus util percentage
+        version = self._run_query("action=getversion")
+        for k in ["ReleaseInfo", "Version"]:
+            yield from self._return_oneshot(f"Server/{k}", version[k])
         devices = self._run_query("action=getdevices")["DeviceArray"]
         for device in devices:
             for k, v in device.items():
