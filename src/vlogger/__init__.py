@@ -1,22 +1,20 @@
 from vlogger import nt4, wpilog, hoot
 import logging
+import urllib.parse
 
 SOURCES = [
-    # Hoot is above 
     hoot.Hoot,
     wpilog.WPILog,
-    # Order is very important here, live sources (specifically NT4) should be at the end
-    # It is much harder to validate that a live connection is actually the correct source
-    # While log files usually have a header or equivalent
     nt4.NetworkTables4
 ]
 
-def get_source(path: str, listeners: list, **kwargs):
+def get_source(ident: str, listeners: list, **kwargs):
+    url = urllib.parse.urlparse(ident)
     for Source in SOURCES:
         try:
-            return Source(path, listeners, **kwargs)
-        except Exception as e:
-            logging.debug(f"Source {Source.__name__} skipped, encountered error '{e}'")
+            return Source(url, listeners, **kwargs)
+        except TypeError:
+            pass
 
     # TODO: Find a real built in exception class or create new one SourceNotFound
     raise Exception("Source not found")
