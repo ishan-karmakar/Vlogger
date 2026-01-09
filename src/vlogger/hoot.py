@@ -1,7 +1,7 @@
 import re
 from vlogger import wpilog
 import logging, os, tempfile
-import shutil
+import shutil, subprocess
 from urllib.parse import SplitResult, urlsplit
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ class Hoot(wpilog.WPILog):
 
         self.tempdir = tempfile.mkdtemp()
         out = os.path.join(self.tempdir, "hoot.wpilog")
-        os.system(f"{owlet} {ident.path.lstrip('/')} {out} -f wpilog")
+        subprocess.check_call([owlet, ident.path.lstrip('/'), out, "-f", "wpilog"])
 
         super(Hoot, self).__init__(urlsplit(f"wpilog:///{out}"), regex, **kwargs)
 

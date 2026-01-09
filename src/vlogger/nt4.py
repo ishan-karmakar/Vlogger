@@ -5,17 +5,20 @@ import re, io, queue, ntcore
 class NetworkTables4(BaseSource):
     SCHEME = "nt4"
 
-    def __init__(self, ident: SplitResult, regexes):
+    def __init__(self, ident: SplitResult, regex: re.Pattern):
         self.ident = ident
-        self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
+        self.regex = regex
         self.queue = queue.SimpleQueue()
         self.type_decoder = TypeDecoder()
+        self.listeners = []
 
     def __enter__(self):
         ntcore.NetworkTableInstance.getDefault().startClient4("vlogger")
         ntcore.NetworkTableInstance.getDefault().setServer(self.ident.hostname or "localhost", self.ident.port or 0)
-        ntcore.NetworkTableInstance.getDefault().addListener([""], ntcore.EventFlags.kPublish, self._topic_listener)
-        ntcore.NetworkTableInstance.getDefault().addListener(["/.schema/struct:"], ntcore.EventFlags.kValueRemote, self._add_structschema)
+        self.listeners.extend([
+            ntcore.NetworkTableInstance.getDefault().addListener([""], ntcore.EventFlags.kPublish, self._topic_listener),
+            ntcore.NetworkTableInstance.getDefault().addListener(["/.schema/struct:"], ntcore.EventFlags.kValueRemote, self._add_structschema)
+        ])
         return self
 
     def __iter__(self):
@@ -32,14 +35,15 @@ class NetworkTables4(BaseSource):
             raise StopIteration
 
     def __exit__(self, exception_type, exception_value, exception_traceback):
+        for listener in self.listeners:
+            ntcore.NetworkTableInstance.getDefault().removeListener(listener)
         ntcore.NetworkTableInstance.getDefault().stopClient()
 
     def _topic_listener(self, event: ntcore.Event):
         if not isinstance(event.data, ntcore.TopicInfo):
             return
-        for regex in self.regexes:
-            if regex.search(event.data.name):
-                ntcore.NetworkTableInstance.getDefault().addListener(event.data.topic, ntcore.EventFlags.kValueRemote, self._value_listener)
+        if self.regex.search(event.data.name):
+            self.listeners.append(ntcore.NetworkTableInstance.getDefault().addListener(event.data.topic, ntcore.EventFlags.kValueRemote, self._value_listener))
     
     def _value_listener(self, event: ntcore.Event):
         if not isinstance(event.data, ntcore.ValueEventData):
