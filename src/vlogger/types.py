@@ -81,3 +81,15 @@ class BaseSource:
     @abstractmethod
     def __init__(self, ident: SplitResult, regex: re.Pattern, **kwargs):
         raise NotImplementedError
+    
+    @abstractmethod
+    def __enter__(self):
+        raise NotImplementedError
+    
+    @abstractmethod
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        raise NotImplementedError
+
+    @abstractmethod
+    def __iter__(self):
+        raise NotImplementedError
