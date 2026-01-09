@@ -1,6 +1,6 @@
 [project]
 name = "frc-vlogger"
-version = "2026.0.0"
+version = "2026.0.1"
 license = "Apache-2.0"
 description = "FRC post match + live match logging reader abstraction"
 authors = [
