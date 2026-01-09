@@ -22,9 +22,15 @@ test-pypi:
   rules:
   - if: $CI_MERGE_REQUEST_ID
   script:
-  - python -m poetry config repositories.test-pypi https://test.pypi.org/legacy
+  - python -m poetry config repositories.test-pypi https://test.pypi.org/legacy/
   - python -m poetry config pypi-token.test-pypi $TEST_PYPI_TOKEN
-  - python -m poetry publish -r test-pypi
+  - |
+    python -m poetry publish -r test-pypi 2>&1 | tee publish.log || EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ]; then
+      if ! grep -q 'File already exists' publish.log; then
+        echo File already exists
+      fi
+    fi
 
 pypi:
   stage: deploy
