@@ -14,21 +14,28 @@ default:
       - .cache/pip
 
   before_script:
-    - pip install virtualenv
-    - virtualenv venv
-    - source venv/bin/activate
-    - pip install -r requirements.txt
+    - pip install poetry
+    - python -m poetry build
 
-deploy-job:
+test-pypi:
   stage: deploy
-  when: manual
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == 'push'
+  - if: $CI_MERGE_REQUEST_ID
   script:
-    - python -m build
-    - python -m twine upload dist/*
-  environment: deploy
-  artifacts:
-    paths:
-      - dist/*
-    expire_in: 3 days
+  - python -m poetry config repositories.test-pypi https://test.pypi.org/legacy/
+  - python -m poetry config pypi-token.test-pypi $TEST_PYPI_TOKEN
+  - |
+    python -m poetry publish -r test-pypi 2>&1 | tee publish.log || EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ]; then
+      if ! grep -q 'File already exists' publish.log; then
+        echo File already exists
+      fi
+    fi
+
+pypi:
+  stage: deploy
+  rules:
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+  - python -m poetry config pypi-token.pypi $PYPI_TOKEN
+  - python -m poetry publish
