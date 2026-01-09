@@ -27,12 +27,13 @@ MODEL_CLASS_MAPPING = {
 class PhoenixDiagnosticServer(BaseSource):
     SCHEME = "pds"
 
-    def __init__(self, ident: SplitResult, regex: re.Pattern):
+    def __init__(self, ident: SplitResult, regex: re.Pattern, **kwargs):
         self.netloc = f"{ident.hostname or "localhost"}:{ident.port or 1250}"
         self.regex = regex
         self.session = requests.Session()
         self.device_map: dict[int, dict] = {}
         self.signal_map = {}
+        self.resolution = kwargs.get("resolution", 50)
 
     def __enter__(self):
         return self
@@ -99,7 +100,7 @@ class PhoenixDiagnosticServer(BaseSource):
                 "model": self.device_map[id]["Model"],
                 "id": id,
                 "signals": ",".join(map(str, self.device_map[id]["signals"])),
-                "resolution": 50
+                "resolution": self.resolution
             })
             for point in response["Points"]:
                 yield point

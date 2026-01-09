@@ -19,7 +19,6 @@ class WPILog(BaseSource):
         self.field_map = {}
         self.type_decoder = TypeDecoder()
         self.log = DataLogReader(ident.path.lstrip('/'))
-        self.resolution = kwargs.get("resolution", 50)
     
     def __enter__(self):
         pass
