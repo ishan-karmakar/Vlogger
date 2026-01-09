@@ -14,11 +14,12 @@ GETTERS = {
 class WPILog(BaseSource):
     SCHEME = "wpilog"
 
-    def __init__(self, ident: SplitResult, regexes: list, **kwargs):
-        self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
+    def __init__(self, ident: SplitResult, regex: re.Pattern, **kwargs):
+        self.regex = regex
         self.field_map = {}
         self.type_decoder = TypeDecoder()
         self.log = DataLogReader(ident.path.lstrip('/'))
+        self.resolution = kwargs.get("resolution", 50)
     
     def __enter__(self):
         pass
@@ -51,10 +52,8 @@ class WPILog(BaseSource):
         public: bool | None = None
         if data.type == "structschema":
             public = False
-        for regex in self.regexes:
-            if regex.search(data.name):
-                public = True
-                break
+        if self.regex.search(data.name):
+            public = True
         if public is not None:
             getter = GETTERS.get(data.type.rstrip("[]"))
             if getter:

@@ -1,3 +1,4 @@
+import re
 from vlogger import nt4, wpilog, hoot, pds
 import urllib.parse
 
@@ -10,11 +11,11 @@ SOURCES: list[type[BaseSource]] = [
     pds.PhoenixDiagnosticServer
 ]
 
-def get_source(ident: str, listeners: list, **kwargs):
+def get_source(ident: str, regex: str | re.Pattern, **kwargs):
     url = urllib.parse.urlsplit(ident)
     for Source in SOURCES:
         if Source.SCHEME == url.scheme:
-            return Source(url, listeners, **kwargs)
+            return Source(url, re.compile(regex) if isinstance(regex, str) else regex, **kwargs)
 
     # TODO: Find a real built in exception class or create new one SourceNotFound
     raise Exception("Source not found")

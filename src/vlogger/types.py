@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import re
 import logging, struct, io
 from urllib.parse import SplitResult
 from google.protobuf.descriptor_pool import DescriptorPool
@@ -78,5 +79,5 @@ class BaseSource:
     SCHEME = ""
 
     @abstractmethod
-    def __init__(self, ident: SplitResult, regexes, **kwargs):
+    def __init__(self, ident: SplitResult, regex: re.Pattern, **kwargs):
         raise NotImplementedError

@@ -27,9 +27,9 @@ MODEL_CLASS_MAPPING = {
 class PhoenixDiagnosticServer(BaseSource):
     SCHEME = "pds"
 
-    def __init__(self, ident: SplitResult, regexes):
+    def __init__(self, ident: SplitResult, regex: re.Pattern):
         self.netloc = f"{ident.hostname or "localhost"}:{ident.port or 1250}"
-        self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
+        self.regex = regex
         self.session = requests.Session()
         self.device_map: dict[int, dict] = {}
         self.signal_map = {}
@@ -80,12 +80,11 @@ class PhoenixDiagnosticServer(BaseSource):
             if class_name in MODEL_CLASS_MAPPING:
                 signals = self.common_signals[class_name] | signals
             for code, signal in signals.items():
-                for regex in self.regexes:
-                    if regex.search(f"ID {device["ID"]}/{signal}"):
-                        self.device_map.setdefault(device["ID"], device | { "signals": [] })
-                        self.device_map[device["ID"]]["signals"].append(code)
-                        self.signal_map[code] = signal
-                        break
+                if self.regex.search(f"ID {device["ID"]}/{signal}"):
+                    self.device_map.setdefault(device["ID"], device | { "signals": [] })
+                    self.device_map[device["ID"]]["signals"].append(code)
+                    self.signal_map[code] = signal
+                    break
 
     def _get_common_signals(self):
         body = self._run_query({ "action": "getcommonsignals" })["Signals"]
@@ -106,10 +105,8 @@ class PhoenixDiagnosticServer(BaseSource):
                 yield point
 
     def _return_oneshot(self, name: str, data):
-        for regex in self.regexes:
-            if regex.search(name):
-                yield { "name": name, "data": data }
-                break
+        if self.regex.search(name):
+            yield { "name": name, "data": data }
 
     def _run_query(self, query: dict):
         return self.session.get(urlunsplit(("http", self.netloc, "", urlencode(query), "")), timeout=10).json()
