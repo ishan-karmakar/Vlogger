@@ -8,7 +8,7 @@ This package is developed and used by FRC Valor 6800 for post match analysis.
 - [x] [NetworkTables4](https://github.com/wpilibsuite/allwpilib/blob/main/ntcore/doc/networktables4.adoc) (supports structs and protobufs)
 - [x] [CTRE Hoot](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/api-usage/signal-logging.html) (file format does not support custom types)
 - [ ] DSLog/DSEvents, unlikely to be added soon
-- [ ] Phoenix Diagnostic Server
+- [x] Phoenix Diagnostic Server
 
 ## Motivation
 Clients usually just care about the "meat" of the source (that is, the field name, the value, and the timestamp). It usually does not matter to the client where the data came from (i.e. the logic is the same whether it is from a live source or from a log file), and this means that every source should be exposed in a single API that should be a drop in replacement.  
