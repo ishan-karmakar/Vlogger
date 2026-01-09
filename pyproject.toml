@@ -1,20 +1,14 @@
-[build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "frc-vlogger"
+version = "2026.0.0"
 license = "Apache-2.0"
 description = "FRC post match + live match logging reader abstraction"
-version = "2026.0.0"
 authors = [
-    { name = "Ishan Karmakar", email = "ishan.karmakar24@gmail.com" },
-    { name = "Thomas Godden", email = "thomas.godden@outlook.com" }
+    {name = "Ishan Karmakar",email = "ishan.karmakar24@gmail.com"},
+    {name = "Thomas Godden",email = "thomas.godden@outlook.com"}
 ]
 readme = "README.md"
 keywords = ["frc", "parser", "networktables", "networktables", "wpilog", "hoot", "ctre"]
-dependencies = ["protobuf", "pyntcore", "robotpy-wpiutil"]
-requires-python = ">=3.7"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Operating System :: OS Independent",
@@ -29,6 +23,15 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Intended Audience :: Developers"
 ]
+requires-python = ">=3.13,<3.14"
+dependencies = ["protobuf", "pyntcore", "robotpy-wpiutil"]
+
+[tool.poetry]
+packages = [{include = "vlogger", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
 
 [project.urls]
 Repository = "https://git.valor6800.com/valor6800/vlogger"
