@@ -1,4 +1,4 @@
-from urllib.parse import ParseResult
+from urllib.parse import SplitResult
 from vlogger.types import BaseSource, TypeDecoder
 import io, re
 from wpiutil.log import DataLogRecord, DataLogReader
@@ -14,8 +14,8 @@ GETTERS = {
 class WPILog(BaseSource):
     SCHEME = "wpilog"
 
-    def __init__(self, ident: ParseResult, regexes: list, **kwargs):
-        self.regexes = [re.compile(r) if type(r) == str else r for r in regexes]
+    def __init__(self, ident: SplitResult, regex: re.Pattern, **kwargs):
+        self.regex = regex
         self.field_map = {}
         self.type_decoder = TypeDecoder()
         self.log = DataLogReader(ident.path.lstrip('/'))
@@ -51,10 +51,8 @@ class WPILog(BaseSource):
         public: bool | None = None
         if data.type == "structschema":
             public = False
-        for regex in self.regexes:
-            if regex.search(data.name):
-                public = True
-                break
+        if self.regex.search(data.name):
+            public = True
         if public is not None:
             getter = GETTERS.get(data.type.rstrip("[]"))
             if getter:

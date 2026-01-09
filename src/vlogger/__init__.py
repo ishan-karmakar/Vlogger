@@ -1,4 +1,5 @@
-from vlogger import nt4, wpilog, hoot
+import re
+from vlogger import nt4, wpilog, hoot, pds
 import urllib.parse
 
 from vlogger.types import BaseSource
@@ -6,14 +7,15 @@ from vlogger.types import BaseSource
 SOURCES: list[type[BaseSource]] = [
     hoot.Hoot,
     wpilog.WPILog,
-    nt4.NetworkTables4
+    nt4.NetworkTables4,
+    pds.PhoenixDiagnosticServer
 ]
 
-def get_source(ident: str, listeners: list, **kwargs):
-    url = urllib.parse.urlparse(ident)
+def get_source(ident: str, regex: str | re.Pattern, **kwargs):
+    url = urllib.parse.urlsplit(ident)
     for Source in SOURCES:
         if Source.SCHEME == url.scheme:
-            return Source(url, listeners, **kwargs)
+            return Source(url, re.compile(regex) if isinstance(regex, str) else regex, **kwargs)
 
     # TODO: Find a real built in exception class or create new one SourceNotFound
     raise Exception("Source not found")
