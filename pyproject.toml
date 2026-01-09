@@ -1,6 +1,6 @@
 [project]
 name = "frc-vlogger"
-version = "2026.0.1"
+version = "2026.0.2"
 license = "Apache-2.0"
 description = "FRC post match + live match logging reader abstraction"
 authors = [
@@ -14,16 +14,15 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Intended Audience :: Developers"
 ]
-requires-python = ">=3.9,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = ["protobuf", "pyntcore", "robotpy-wpiutil"]
 
 [tool.poetry]
