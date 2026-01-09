@@ -214,5 +214,5 @@ robotpy-native-wpiutil = "2026.1.1"
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.10,<3.15"
-content-hash = "5ee68e735132106b259a0e1a327af09b2999488288ffc7a2c7e7b991d92e1839"
+python-versions = ">=3.9"
+content-hash = "8cb4b5d478bcb93cfa8b5ede32e45db2f217ae4d3cd5950fbba48a1fadae776d"
