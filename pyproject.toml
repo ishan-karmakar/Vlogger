@@ -1,6 +1,6 @@
 [project]
 name = "frc-vlogger"
-version = "2026.0.2"
+version = "2026.0.3"
 license = "Apache-2.0"
 description = "FRC post match + live match logging reader abstraction"
 authors = [
@@ -23,7 +23,7 @@ classifiers = [
     "Intended Audience :: Developers"
 ]
 requires-python = ">=3.10,<3.15"
-dependencies = ["protobuf", "pyntcore", "robotpy-wpiutil"]
+dependencies = ["protobuf (>=6.33.2,<7.0.0)", "pyntcore (>=2026.1.1,<2027.0.0)", "robotpy-wpiutil (>=2026.1.1,<2027.0.0)"]
 
 [tool.poetry]
 packages = [{include = "vlogger", from = "src"}]

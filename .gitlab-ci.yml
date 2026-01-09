@@ -25,7 +25,7 @@ test-pypi:
   - python -m poetry config repositories.test-pypi https://test.pypi.org/legacy/
   - python -m poetry config pypi-token.test-pypi $TEST_PYPI_TOKEN
   - |
-    if ! python -m poetry publish -r test-pypi; then
+    if ! python -m poetry publish -r test-pypi 2>&1 | tee publish.log; then
       if ! grep -q 'File already exists' publish.log; then
         exit 1
       fi
