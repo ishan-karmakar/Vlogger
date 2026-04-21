@@ -5,6 +5,10 @@ test.py
 *.wpilog
 *.hoot
 owlet.exe
+logs/
+
+# Generated analysis reports (all per-match + season markdown outputs)
+analysis/reports/
 
 .venv/
 
