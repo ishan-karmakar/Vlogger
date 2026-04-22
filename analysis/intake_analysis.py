@@ -1,417 +1,1171 @@
 # -*- coding: utf-8 -*-
 """
-Intake energy & performance analysis for FRC Team Valor 6800.
+Intake motor + jam analysis for FRC Team Valor 6800.
 
-Two motors : Left Intake Motor, Right Intake Motor
-Cycle model: Intake State transitions (OFF <-> INTAKING)
-Power      : |Out Volt| x |Stator Current| per motor, summed
+Two intake motors (Left / Right) and two feeder motors (Left / Right).
+The robot publishes "Intake State" (OFF / INTAKING / SHOOTING) plus a
+boolean "Intake Jam" that we cross-check with our own detector.
+
+Metrics per match and across the season:
+  - Per motor, per state: mean / p95 / max stator + supply current, |speed|
+  - Time spent in each state; total time on + total energy (intake motors)
+  - Robot-reported "Intake Jam" event count (rising edges of the bool)
+  - Custom jam detector events — see JAM DETECTION section below
+
+-------------------------------------------------------------------------------
+ROBOT-SIDE JAM DETECTION (as of repo snapshot, src/main/cpp/subsystems/Intake.cpp)
+
+One-sentence summary: "Intake Jam" = true iff
+    (7-tap moving average of LEFT intake stator current >= 50 A)
+    AND (LEFT intake motor speed < 1 TPS).
+
+  - Only the LEFT intake motor is monitored; the right is ignored.
+  - Only STATOR current is checked (not supply).
+  - No debounce / hysteresis — the flag can toggle cycle-to-cycle (~20 ms).
+  - No cooldown — a single physical jam typically re-triggers across
+    many cycles as the motor briefly recovers speed.
+  - On detect: rumble on the driver gamepad (0.1) and write the bool to
+    NT. No automatic reversal, no state change, shooting still allowed.
+
+Implications for our analysis:
+  - The robot's rising-edge count under-reports physical jams because one
+    stall can rumble continuously without a clean edge, or re-trigger
+    many times for the same jam.
+  - Right-side or feeder-side issues are invisible to the robot detector.
+
+-------------------------------------------------------------------------------
+CUSTOM JAM DETECTOR
+
+  Per intake motor:
+    stalled(motor, t) = (|stator_current(t)| >= CUSTOM_STALL_CURRENT_A)
+                         AND (|speed(t)|          <  CUSTOM_STALL_SPEED_TPS)
+                         AND (|reqSpeed(t)|       >= CUSTOM_MIN_REQ_SPEED)
+
+  An event fires when ANY motor (left or right intake) has been stalled
+  continuously for >= CUSTOM_MIN_DURATION_S. Event stays active until the
+  motor recovers (current drops OR speed picks up) for at least
+  CUSTOM_CLEAR_DURATION_S. A JAM_COOLDOWN_S window between events prevents
+  the same physical jam from being counted multiple times.
+
+  Each event is classified:
+    LEFT_ONLY / RIGHT_ONLY / BOTH   (which motors were stalled)
+    state                           (OFF / INTAKING / SHOOTING at event start)
+    peak stator current, min speed during the stall, and duration
+
+  Rationale vs the robot detector:
+    - Both motors watched — catches right-side issues.
+    - reqSpeed gate eliminates false positives when the intake is
+      actively commanded OFF.
+    - Debounce + cooldown collapses runs of re-triggers into single
+      "jam events" that match what a driver would subjectively call one
+      jam.
+    - Slightly lower current threshold catches the onset of a stall
+      before the motor fully hits the current limit.
 """
 
 import sys
 import os
+import glob
+import io
+import time
+import datetime
+import contextlib
+import concurrent.futures
+import subprocess
+import tempfile
+import shutil
 import numpy as np
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import vlogger
+# Shared CAN ID -> motor label config (edit analysis/can_config.py to update
+# mappings when the robot CAN IDs change).
+from can_config import CAN_DEVICES, CAN_DEVICES_BY_LABEL, SUBSYSTEMS
 
 # -- Configuration ---------------------------------------------------------------
 
-_log_abs = os.path.abspath(os.path.join(
+DEFAULT_LOG = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "logs", "GF1",
     "FRC_20260418_213237_TXCMP_E1.wpilog"
 )).replace("\\", "/")
-LOG_PATH = f"wpilog:///{_log_abs}"
 
-INTAKE_REGEX = r"NT:/SmartDashboard/Intake/(Intake State|Intake Jam|(Left|Right) Intake Motor/(Speed|Stator Current|Supply Current|Out Volt|reqSpeed))"
+# Motors we track. Keyed by a short label used in output.
+INTAKE_MOTORS = {
+    "Left Intake":  "NT:/SmartDashboard/Intake/Left Intake Motor",
+    "Right Intake": "NT:/SmartDashboard/Intake/Right Intake Motor",
+}
+FEEDER_MOTORS = {
+    "Left Feeder":  "NT:/SmartDashboard/Intake/Left Feeder Motor",
+    "Right Feeder": "NT:/SmartDashboard/Intake/Right Feeder Motor",
+}
 
-L_SPEED    = "NT:/SmartDashboard/Intake/Left Intake Motor/Speed"
-L_STATOR   = "NT:/SmartDashboard/Intake/Left Intake Motor/Stator Current"
-L_SUPPLY   = "NT:/SmartDashboard/Intake/Left Intake Motor/Supply Current"
-L_VOLTAGE  = "NT:/SmartDashboard/Intake/Left Intake Motor/Out Volt"
-L_REQSPEED = "NT:/SmartDashboard/Intake/Left Intake Motor/reqSpeed"
-R_SPEED    = "NT:/SmartDashboard/Intake/Right Intake Motor/Speed"
-R_STATOR   = "NT:/SmartDashboard/Intake/Right Intake Motor/Stator Current"
-R_SUPPLY   = "NT:/SmartDashboard/Intake/Right Intake Motor/Supply Current"
-R_VOLTAGE  = "NT:/SmartDashboard/Intake/Right Intake Motor/Out Volt"
-R_REQSPEED = "NT:/SmartDashboard/Intake/Right Intake Motor/reqSpeed"
+# Per motor we need: Speed, Stator Current, Supply Current, Out Volt, reqSpeed.
+# Feeders don't publish Supply Current (handled gracefully by load_series).
+SIGNALS_PER_MOTOR = ["Speed", "Stator Current", "Supply Current", "Out Volt", "reqSpeed"]
+
 STATE_PATH = "NT:/SmartDashboard/Intake/Intake State"
 JAM_PATH   = "NT:/SmartDashboard/Intake/Intake Jam"
 
-AT_SPEED_FRACTION = 0.80    # "reached commanded speed" threshold
-MIN_CYCLE_SECS    = 0.10    # ignore INTAKING blips shorter than this
-STALL_FRACTION    = 0.30    # below this fraction of reqSpeed -> stalled / jammed
-MIN_REQ_SPEED     = 1.0
+INTAKE_REGEX = (
+    r"(NT:/SmartDashboard/Intake/(Intake State|Intake Jam|"
+    r"(Left|Right) (Intake|Feeder|Hopper) Motor/"
+    r"(Speed|Stator Current|Supply Current|Out Volt|reqSpeed))"
+    r"|DS:(enabled|autonomous))"
+)
+
+# Custom jam detector parameters — tune here if the physical intake changes.
+CUSTOM_STALL_CURRENT_A   = 45.0   # |stator current| above this = stalled
+CUSTOM_STALL_SPEED_TPS   = 2.0    # |speed| below this = stalled
+CUSTOM_MIN_REQ_SPEED     = 1.0    # only count if we're actually commanding motion
+CUSTOM_MIN_DURATION_S    = 0.15   # stall must persist this long to count
+CUSTOM_CLEAR_DURATION_S  = 0.20   # recovery must persist this long before event ends
+CUSTOM_COOLDOWN_S        = 0.50   # min gap between distinct jam events
+
+# For reference / comparison in the report — these are the robot's thresholds.
+ROBOT_JAM_CURRENT_A      = 50.0
+ROBOT_JAM_SPEED_TPS      = 1.0
+
+# --- Hoot integration (optional, higher-fidelity current + speed) -------------
+# The intake + hopper motors are on the RIO CAN bus; feeder motors on the
+# Canivore bus. A season's TXCMP log folder typically contains:
+#   <match>_rio_<date>.hoot               -> intake, hopper
+#   <match>_<canivore-serial>_<date>.hoot -> flywheel, feeder, swerve
+# Both are scanned and merged via the shared can_config.CAN_DEVICES map.
+# Only labels we actually want to overlay from hoot (the analyzer's motors).
+HOOT_LABELS_TO_OVERLAY = (
+    SUBSYSTEMS["intake"] + SUBSYSTEMS["hopper"] + SUBSYSTEMS["feeder"]
+)
+# Hoot signal -> NT-style signal name. Hoot RotorVelocity is rotations/sec at
+# the motor (matches the "TPS" semantics of NT Speed for our purposes — the
+# jam detector uses ratios, not absolute speeds).
+HOOT_SIGNAL_MAP = {
+    "StatorCurrent":  "Stator Current",
+    "SupplyCurrent":  "Supply Current",
+    "RotorVelocity":  "Speed",
+    "MotorVoltage":   "Out Volt",
+}
+
+# Signal-grouping helpers
+INTAKE_STATES = ["OFF", "INTAKING", "SHOOTING"]
+
+SEP = "-" * 72
+
+def progress(msg):
+    sys.stderr.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    sys.stderr.flush()
 
 # -- Data loading ----------------------------------------------------------------
 
-def load_series():
+def load_series(log_path):
+    """
+    Load NT series from a WPILog and (if a sibling .hoot log is found) overlay
+    high-fidelity Phoenix signals for intake / feeder motor currents + speeds.
+    The hoot overlay REPLACES the corresponding low-rate NT series on overlap
+    (higher sample rate + more accurate during transients), but the NT series
+    are still loaded so non-hoot signals (state, jam bool, reqSpeed) work
+    unchanged.
+    """
     raw = defaultdict(list)
-    print("Loading log ...")
-    src = vlogger.get_source(LOG_PATH, INTAKE_REGEX)
+    url = f"wpilog:///{log_path}" if not log_path.startswith("wpilog:") else log_path
+    src = vlogger.get_source(url, INTAKE_REGEX)
     with src:
         for entry in src:
             name = entry["name"]
             ts   = entry["timestamp"] / 1e6
             val  = entry["data"]
-            if isinstance(val, bool):
-                raw[name].append((ts, bool(val)))
-            elif isinstance(val, (int, float)):
-                raw[name].append((ts, float(val)))
-            elif isinstance(val, str):
-                raw[name].append((ts, val))
+            raw[name].append((ts, val))
     for name in raw:
         raw[name].sort(key=lambda x: x[0])
+
+    # Try to overlay hoot data when available. Tolerates missing owlet.
+    # Walk every sibling hoot (both RIO + Canivore buses) since intake motors
+    # live on RIO and feeders live on Canivore.
+    for hoot_path in _find_sibling_hoots(log_path):
+        try:
+            _overlay_hoot_into(raw, hoot_path)
+        except Exception as ex:
+            sys.stderr.write(
+                f"WARNING: hoot overlay for {os.path.basename(hoot_path)} "
+                f"failed ({type(ex).__name__}: {ex}); using NT currents.\n")
+
     return dict(raw)
 
-# -- Helpers ---------------------------------------------------------------------
+def _find_sibling_hoots(log_path):
+    """
+    Find every .hoot log in the same folder tree as the wpilog. We return
+    ALL of them (not just one), because a season folder typically has both
+    a RIO-bus hoot and a Canivore hoot — each with different motors — and
+    we want to merge from both.
+    """
+    log_dir = os.path.dirname(os.path.abspath(log_path))
+    hoots = []
+    for root, _, files in os.walk(log_dir):
+        for f in files:
+            if f.lower().endswith(".hoot"):
+                hoots.append(os.path.join(root, f))
+    return sorted(hoots)
 
-def to_np(series, name):
-    pts = series.get(name)
-    if not pts or not isinstance(pts[0][1], (float, int)):
-        return None, None
-    return np.array([p[0] for p in pts]), np.array([float(p[1]) for p in pts])
+def _find_owlet():
+    """Return path to owlet.exe — PATH first, then repo root fallback."""
+    on_path = shutil.which("owlet")
+    if on_path:
+        return on_path
+    repo_owlet = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                               "..", "owlet.exe"))
+    return repo_owlet if os.path.isfile(repo_owlet) else None
 
-def interp_at(ts_target, ts_src, vals_src):
-    if ts_src is None or len(ts_src) < 2:
-        return np.zeros_like(ts_target, dtype=float)
-    return np.interp(ts_target, ts_src, vals_src,
-                     left=vals_src[0], right=vals_src[-1])
+def _owlet_scan(hoot_path, owlet_exe):
+    """
+    Run `owlet <hoot> --scan` and return a dict of signal_name -> hex_id.
+    Scan is cheap (sub-second even for large hoots) because it just indexes
+    the file without decoding values.
 
-def energy_in_window(ts_grid, power, t_start, t_end):
-    mask = (ts_grid >= t_start) & (ts_grid <= t_end)
-    if mask.sum() < 2:
-        return 0.0
-    return float(np.trapezoid(power[mask], ts_grid[mask]))
-
-def mean_in_window(ts_grid, signal, t_start, t_end):
-    mask = (ts_grid >= t_start) & (ts_grid <= t_end)
-    if mask.sum() == 0:
-        return 0.0
-    return float(np.mean(signal[mask]))
-
-def peak_in_window(ts_grid, signal, t_start, t_end):
-    mask = (ts_grid >= t_start) & (ts_grid <= t_end)
-    if mask.sum() == 0:
-        return 0.0
-    return float(np.max(signal[mask]))
-
-# -- State-based cycle detection -------------------------------------------------
-
-def find_state_windows(state_pts, target_state):
-    """Find contiguous windows where state == target_state."""
-    windows = []
-    in_win  = False
-    t_start = None
-    for ts, val in state_pts:
-        if not in_win and val == target_state:
-            in_win  = True
-            t_start = ts
-        elif in_win and val != target_state:
-            in_win = False
-            if ts - t_start >= MIN_CYCLE_SECS:
-                windows.append((t_start, ts))
-            t_start = None
-    if in_win and t_start is not None:
-        windows.append((t_start, state_pts[-1][0]))
-    return windows
-
-def count_jams_in_window(jam_pts, t_start, t_end):
-    """Count rising edges of the jam signal within the window."""
-    count    = 0
-    prev_val = None
-    for ts, val in jam_pts:
-        if ts < t_start:
-            prev_val = bool(val)
+    Example input line:
+        TalonFX-12/StatorCurrent:                                 6f30c00
+    """
+    result = subprocess.run(
+        [owlet_exe, hoot_path, "--scan"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        check=False, text=True,
+    )
+    out = {}
+    for line in (result.stdout or "").splitlines():
+        # Lines look like "NAME:<spaces>HEXID" — split on ':' once and strip
+        if ":" not in line:
             continue
-        if ts > t_end:
-            break
-        v = bool(val)
-        if prev_val is not None and (not prev_val) and v:
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        hex_id = rest.strip()
+        if name and hex_id and all(c in "0123456789abcdefABCDEF" for c in hex_id):
+            out[name] = hex_id
+    return out
+
+def _wanted_hoot_signal_names():
+    """Build the set of 'TalonFX-<id>/<SignalName>' entries we want from hoots."""
+    names = set()
+    for label in HOOT_LABELS_TO_OVERLAY:
+        entry = CAN_DEVICES_BY_LABEL.get(label)
+        if not entry:
+            continue
+        kind, can_id = entry
+        if kind != "TalonFX":
+            continue
+        for hoot_sig in HOOT_SIGNAL_MAP.keys():
+            names.add(f"{kind}-{can_id}/{hoot_sig}")
+    return names
+
+def _decode_hoot_filtered(hoot_path, owlet_exe, signal_ids):
+    """
+    Run `owlet <hoot> <tmp.wpilog> -f wpilog -s <ids>` to decode ONLY the
+    signals we care about. Returns path to the output wpilog, or None if
+    nothing usable was produced. Tolerates rc=1 from owlet when the output
+    file is still valid (owlet emits "Could not read to end of input file"
+    as a non-fatal warning at EOF).
+    """
+    if not signal_ids:
+        return None
+    tmp_dir = tempfile.mkdtemp(prefix="hoot_overlay_")
+    out_path = os.path.join(tmp_dir, "filtered.wpilog")
+    cmd = [owlet_exe, hoot_path, out_path,
+           "-f", "wpilog", "-s", ",".join(signal_ids)]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=False)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+    return out_path
+
+def _read_filtered_wpilog(wpilog_path, accepted_names):
+    """
+    Stream a (small) filtered wpilog via wpiutil and return a dict of
+    signal_name -> [(ts_seconds, float_value), ...] for signals in
+    accepted_names. Matches names either exactly or by suffix (owlet often
+    prefixes entries with "/CTRELogger/" or similar when writing wpilog —
+    we match on the tail so configuration is easier).
+    """
+    from wpiutil.log import DataLogReader
+    reader = DataLogReader(wpilog_path)
+    entry_map = {}    # entry_id -> canonical signal name (key in accepted_names)
+    out = defaultdict(list)
+
+    # Build a lookup from suffix match
+    def match_name(entry_name):
+        if entry_name in accepted_names:
+            return entry_name
+        # Try matching by "<device>-<id>/<signal>" suffix anywhere in the entry
+        for want in accepted_names:
+            if entry_name.endswith(want) or entry_name.endswith("/" + want):
+                return want
+        return None
+
+    for rec in reader:
+        if rec.isStart():
+            d = rec.getStartData()
+            canon = match_name(d.name)
+            if canon is not None:
+                entry_map[d.entry] = canon
+            continue
+        if rec.isFinish():
+            entry_map.pop(rec.getFinishEntry(), None)
+            continue
+        eid = rec.getEntry()
+        if eid not in entry_map:
+            continue
+        canon = entry_map[eid]
+        # All targets are doubles (stator/supply/voltage/velocity)
+        try:
+            val = rec.getDouble()
+        except Exception:
+            continue
+        out[canon].append((rec.getTimestamp() / 1e6, float(val)))
+    for name in out:
+        out[name].sort(key=lambda x: x[0])
+    return dict(out)
+
+def _overlay_hoot_into(raw, hoot_path):
+    """
+    Overlay high-fidelity Phoenix current/speed samples from a hoot file onto
+    the NT-sampled `raw` dict. Steps:
+      1. owlet --scan (fast) -> build signal-name -> hex-ID map
+      2. filter to the signals we care about
+      3. owlet -s <ids> -f wpilog (filtered decode, fast)
+      4. read the filtered wpilog and convert TalonFX-N/SignalName keys
+         back to NT-style analyzer keys
+      5. REPLACE the corresponding NT series in `raw`
+
+    Bypasses vlogger.Hoot because check_call doesn't tolerate owlet's
+    non-zero EOF warning, and we want the -s filter which vlogger doesn't
+    currently pass through.
+    """
+    owlet_exe = _find_owlet()
+    if not owlet_exe:
+        raise RuntimeError("owlet not found on PATH or at repo root")
+
+    wanted_names = _wanted_hoot_signal_names()
+    if not wanted_names:
+        return
+
+    # Scan to get hex signal IDs for filter.
+    name_to_id = _owlet_scan(hoot_path, owlet_exe)
+    signal_ids = [name_to_id[n] for n in wanted_names if n in name_to_id]
+    if not signal_ids:
+        # No matching devices in this hoot (probably wrong bus) — silent skip.
+        return
+
+    # Decode only the signals we want.
+    out_wpilog = _decode_hoot_filtered(hoot_path, owlet_exe, signal_ids)
+    if out_wpilog is None:
+        raise RuntimeError("owlet produced no output")
+
+    try:
+        hoot_samples = _read_filtered_wpilog(out_wpilog, wanted_names)
+    finally:
+        shutil.rmtree(os.path.dirname(out_wpilog), ignore_errors=True)
+
+    # Convert hoot signal names (Phoenix6/TalonFX-<id>/<signal>, canonicalized
+    # by _read_filtered_wpilog's suffix match to TalonFX-<id>/<signal>) to the
+    # analyzer's NT-style keys and REPLACE in the series dict — hoot is higher
+    # fidelity than NT-logged currents (event-driven at the Phoenix signal
+    # level, typically 10-100x the sample count during motor activity).
+    total_samples = 0
+    replaced_keys = 0
+    for hoot_name, pts in hoot_samples.items():
+        try:
+            head, signal = hoot_name.split("/", 1)
+            kind, id_str = head.split("-", 1)
+            can_id = int(id_str)
+        except (ValueError, TypeError):
+            continue
+        motor_label = CAN_DEVICES.get((kind, can_id))
+        nt_signal   = HOOT_SIGNAL_MAP.get(signal)
+        if motor_label is None or nt_signal is None:
+            continue
+        nt_key = f"NT:/SmartDashboard/Intake/{motor_label} Motor/{nt_signal}"
+        raw[nt_key] = pts
+        total_samples += len(pts)
+        replaced_keys += 1
+    # One-line summary per hoot — useful to confirm overlay actually landed
+    # without spamming the log.
+    sys.stderr.write(
+        f"[hoot] {os.path.basename(hoot_path)}: "
+        f"{replaced_keys} signals, {total_samples:,} samples\n")
+
+# -- Interval helpers (mirrors the other analysis scripts) -----------------------
+
+def compute_state_intervals(state_pts, target_states, t_end):
+    """
+    Return a dict: state_name -> list of (t_start, t_end) intervals for each
+    of target_states. Any unrecognized state values are ignored.
+    """
+    out = {s: [] for s in target_states}
+    cur_state = None
+    cur_start = None
+    for ts, val in state_pts:
+        s = val if isinstance(val, str) else None
+        if s == cur_state:
+            continue
+        if cur_state is not None and cur_state in out and cur_start is not None:
+            out[cur_state].append((cur_start, ts))
+        cur_state = s
+        cur_start = ts
+    if cur_state is not None and cur_state in out and cur_start is not None:
+        out[cur_state].append((cur_start, t_end))
+    return out
+
+def intersect_intervals(a, b):
+    """Return intersection of two lists of (start,end) intervals."""
+    out = []
+    for (a0, a1) in a:
+        for (b0, b1) in b:
+            lo = max(a0, b0)
+            hi = min(a1, b1)
+            if hi > lo:
+                out.append((lo, hi))
+    return out
+
+def compute_enabled_intervals(enabled_pts, t_end):
+    intervals = []
+    cur_start = None
+    for ts, val in enabled_pts:
+        if bool(val) and cur_start is None:
+            cur_start = ts
+        elif not bool(val) and cur_start is not None:
+            intervals.append((cur_start, ts))
+            cur_start = None
+    if cur_start is not None:
+        intervals.append((cur_start, t_end))
+    return intervals
+
+def intervals_total(intervals):
+    return float(sum(t1 - t0 for t0, t1 in intervals))
+
+def overlap_with_intervals(a, b, intervals):
+    if b <= a:
+        return 0.0
+    s = 0.0
+    for t0, t1 in intervals:
+        ov0 = a if a > t0 else t0
+        ov1 = b if b < t1 else t1
+        if ov1 > ov0:
+            s += ov1 - ov0
+    return s
+
+def ts_in_intervals(t, intervals):
+    for t0, t1 in intervals:
+        if t0 <= t <= t1:
+            return True
+    return False
+
+def _build_searchable(pts, value_fn=lambda v: v):
+    if not pts:
+        return np.array([]), []
+    ts_arr = np.array([ts for ts, _ in pts])
+    vals   = [value_fn(v) for _, v in pts]
+    return ts_arr, vals
+
+def _lookup_at(ts, ts_arr, vals, default=None):
+    if len(ts_arr) == 0:
+        return default
+    idx = int(np.searchsorted(ts_arr, ts, side="right")) - 1
+    return vals[idx] if idx >= 0 else default
+
+# -- Stats ---------------------------------------------------------------------
+
+def time_weighted_abs_stats(pts, intervals, t_end):
+    """
+    Time-weighted mean of |value| plus sample-based p50/p95/max. Returns None
+    if no samples. Used for current + speed (both are magnitudes we care about).
+    """
+    if not pts or not intervals:
+        return None
+    samples = []
+    integral = 0.0
+    total_time = 0.0
+    prev_ts = None
+    prev_abs = None
+    for ts, v in pts:
+        if not isinstance(v, (int, float)):
+            continue
+        a = abs(float(v))
+        if ts_in_intervals(ts, intervals):
+            samples.append(a)
+        if prev_ts is not None and prev_abs is not None:
+            ov = overlap_with_intervals(prev_ts, ts, intervals)
+            if ov > 0:
+                integral   += prev_abs * ov
+                total_time += ov
+        prev_ts = ts
+        prev_abs = a
+    if prev_ts is not None and prev_abs is not None:
+        ov = overlap_with_intervals(prev_ts, t_end, intervals)
+        if ov > 0:
+            integral   += prev_abs * ov
+            total_time += ov
+    if not samples or total_time <= 0:
+        return None
+    arr = np.array(samples)
+    return {
+        "n":       len(samples),
+        "mean_tw": float(integral / total_time),
+        "p50":     float(np.percentile(arr, 50)),
+        "p95":     float(np.percentile(arr, 95)),
+        "max":     float(np.max(arr)),
+    }
+
+def energy_over_intervals(voltage_pts, current_pts, intervals, t_end):
+    """
+    Energy = integral of |V| * |I| dt over the union of intervals. Uses the
+    common-grid interpolation approach so we don't need the signals to be
+    sampled at the same points.
+    """
+    if not voltage_pts or not current_pts or not intervals:
+        return 0.0
+    ts_all = sorted(set([ts for ts, _ in voltage_pts] +
+                         [ts for ts, _ in current_pts]))
+    ts_all = np.array(ts_all)
+    vts = np.array([ts for ts, _ in voltage_pts])
+    vvs = np.array([float(v) for _, v in voltage_pts])
+    cts = np.array([ts for ts, _ in current_pts])
+    cvs = np.array([float(v) for _, v in current_pts])
+    v_grid = np.interp(ts_all, vts, vvs, left=vvs[0], right=vvs[-1])
+    c_grid = np.interp(ts_all, cts, cvs, left=cvs[0], right=cvs[-1])
+    p_grid = np.abs(v_grid) * np.abs(c_grid)
+
+    # Integrate only over portions of the grid inside the intervals
+    total = 0.0
+    for i in range(len(ts_all) - 1):
+        t0, t1 = ts_all[i], ts_all[i + 1]
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        ov = overlap_with_intervals(t0, t1, intervals)
+        if ov <= 0:
+            continue
+        total += 0.5 * (p_grid[i] + p_grid[i + 1]) * ov
+    return float(total)
+
+# -- Jam detection -------------------------------------------------------------
+
+def count_rising_edges(bool_pts, intervals):
+    """Count False -> True transitions within the given intervals."""
+    if not bool_pts:
+        return 0
+    count = 0
+    prev = None
+    for ts, v in bool_pts:
+        cur = bool(v)
+        if prev is not None and not prev and cur and ts_in_intervals(ts, intervals):
             count += 1
-        prev_val = v
+        prev = cur
     return count
 
-# -- Main ------------------------------------------------------------------------
+def build_per_motor_searchables(series, base_path):
+    """Return (ts_arr, v_arr) tuples for speed / stator / reqSpeed under base_path."""
+    out = {}
+    for sig in ("Speed", "Stator Current", "reqSpeed"):
+        key = f"{base_path}/{sig}"
+        pts = series.get(key, [])
+        ts_arr, vals = _build_searchable(pts, lambda v: float(v) if isinstance(v, (int, float)) else 0.0)
+        out[sig] = (ts_arr, vals)
+    return out
+
+def detect_custom_jams(series, state_pts, intervals, t_end):
+    """
+    Custom jam detector: walks common-time grid, tracks whether each intake
+    motor is in a stall condition, and emits debounced + cooldown-gated jam
+    events.
+
+    Returns list of dicts:
+      {"t_start", "t_end", "duration", "state",
+       "motors": ["Left Intake", ...], "peak_current_A", "min_speed_TPS"}
+    """
+    # Gather searchable arrays for each intake motor
+    motor_data = {}
+    all_ts = set()
+    for label, base in INTAKE_MOTORS.items():
+        motor_data[label] = build_per_motor_searchables(series, base)
+        for sig in ("Speed", "Stator Current", "reqSpeed"):
+            for ts in motor_data[label][sig][0].tolist():
+                all_ts.add(ts)
+
+    # State lookup
+    state_ts, state_v = _build_searchable(state_pts, lambda v: v if isinstance(v, str) else "UNKNOWN")
+
+    if not all_ts:
+        return []
+
+    ts_grid = np.array(sorted(all_ts))
+
+    def stalled_at(motor, t):
+        cur_ts, cur_v = motor_data[motor]["Stator Current"]
+        spd_ts, spd_v = motor_data[motor]["Speed"]
+        req_ts, req_v = motor_data[motor]["reqSpeed"]
+        cur = _lookup_at(t, cur_ts, cur_v, default=0.0)
+        spd = _lookup_at(t, spd_ts, spd_v, default=0.0)
+        req = _lookup_at(t, req_ts, req_v, default=0.0)
+        return (abs(cur) >= CUSTOM_STALL_CURRENT_A
+                and abs(spd) <  CUSTOM_STALL_SPEED_TPS
+                and abs(req) >= CUSTOM_MIN_REQ_SPEED), cur, spd
+
+    events = []
+    in_event = False
+    event_start = None
+    event_first_clear = None
+    event_motors = set()
+    event_peak_current = 0.0
+    event_min_speed = float("inf")
+    last_event_end = -1e9
+
+    for t in ts_grid:
+        if not ts_in_intervals(t, intervals):
+            continue
+
+        # Which motors are stalled right now?
+        stalled_now = set()
+        max_current_now = 0.0
+        min_speed_now = float("inf")
+        for motor in INTAKE_MOTORS:
+            is_stall, cur, spd = stalled_at(motor, t)
+            if is_stall:
+                stalled_now.add(motor)
+                max_current_now = max(max_current_now, abs(cur))
+                min_speed_now = min(min_speed_now, abs(spd))
+
+        if stalled_now:
+            # Check cooldown gate before opening a new event
+            if not in_event:
+                if t - last_event_end < CUSTOM_COOLDOWN_S:
+                    continue
+                in_event = True
+                event_start = t
+                event_first_clear = None
+                event_motors = set(stalled_now)
+                event_peak_current = max_current_now
+                event_min_speed = min_speed_now
+            else:
+                event_motors.update(stalled_now)
+                event_peak_current = max(event_peak_current, max_current_now)
+                event_min_speed    = min(event_min_speed,    min_speed_now)
+                event_first_clear = None  # reset — we're still stalling
+        else:
+            if in_event:
+                if event_first_clear is None:
+                    event_first_clear = t
+                elif (t - event_first_clear) >= CUSTOM_CLEAR_DURATION_S:
+                    # Close out event — but only if it persisted long enough
+                    duration = event_first_clear - event_start
+                    if duration >= CUSTOM_MIN_DURATION_S:
+                        state = _lookup_at(event_start, state_ts, state_v,
+                                            default="UNKNOWN")
+                        events.append({
+                            "t_start":         float(event_start),
+                            "t_end":           float(event_first_clear),
+                            "duration":        float(duration),
+                            "state":           state,
+                            "motors":          sorted(event_motors),
+                            "peak_current_A":  float(event_peak_current),
+                            "min_speed_TPS":   float(event_min_speed),
+                        })
+                        last_event_end = event_first_clear
+                    in_event = False
+                    event_start = None
+                    event_first_clear = None
+                    event_motors = set()
+                    event_peak_current = 0.0
+                    event_min_speed = float("inf")
+
+    # Flush trailing event if log ends mid-stall
+    if in_event and event_start is not None:
+        end_ts = event_first_clear if event_first_clear is not None else float(ts_grid[-1])
+        duration = end_ts - event_start
+        if duration >= CUSTOM_MIN_DURATION_S:
+            state = _lookup_at(event_start, state_ts, state_v, default="UNKNOWN")
+            events.append({
+                "t_start":         float(event_start),
+                "t_end":           float(end_ts),
+                "duration":        float(duration),
+                "state":           state,
+                "motors":          sorted(event_motors),
+                "peak_current_A":  float(event_peak_current),
+                "min_speed_TPS":   float(event_min_speed),
+            })
+
+    return events
+
+def classify_jam(event):
+    """Turn the motor-set into a short event type label."""
+    m = set(event["motors"])
+    if m == {"Left Intake", "Right Intake"}:
+        return "BOTH"
+    if m == {"Left Intake"}:
+        return "LEFT_ONLY"
+    if m == {"Right Intake"}:
+        return "RIGHT_ONLY"
+    return "OTHER"
+
+# -- Per-log analysis ------------------------------------------------------------
+
+def analyze_log(log_path):
+    series = load_series(log_path)
+    state_pts   = series.get(STATE_PATH, [])
+    jam_pts     = series.get(JAM_PATH, [])
+    enabled_pts = series.get("DS:enabled", [])
+
+    # Timespan
+    all_ts = [ts for ts, _ in enabled_pts] + [ts for ts, _ in state_pts]
+    for motor_base in list(INTAKE_MOTORS.values()) + list(FEEDER_MOTORS.values()):
+        for sig in SIGNALS_PER_MOTOR:
+            for ts, _ in series.get(f"{motor_base}/{sig}", []):
+                all_ts.append(ts)
+    if not all_ts:
+        return None
+
+    t_end = float(max(all_ts))
+    enabled_intervals = compute_enabled_intervals(enabled_pts, t_end)
+    enabled_s = intervals_total(enabled_intervals)
+    if enabled_s <= 0:
+        return None
+
+    # State intervals, intersected with enabled so we only count time the robot
+    # was actually running (state signal keeps publishing pre-match too).
+    raw_state_intervals = compute_state_intervals(state_pts, INTAKE_STATES, t_end)
+    state_intervals = {s: intersect_intervals(raw_state_intervals[s], enabled_intervals)
+                        for s in INTAKE_STATES}
+    state_secs = {s: intervals_total(state_intervals[s]) for s in INTAKE_STATES}
+
+    # Per-motor, per-state stats. For each motor we compute:
+    #   stator_abs, supply_abs, speed_abs stats restricted to each state's
+    #   intervals (and a separate "all enabled" bucket).
+    motor_stats = {}
+    motor_totals = {}  # overall enabled-time stats per motor
+    motor_energy = {}
+    for label, base in {**INTAKE_MOTORS, **FEEDER_MOTORS}.items():
+        spd_pts = series.get(f"{base}/Speed", [])
+        cst_pts = series.get(f"{base}/Stator Current", [])
+        sup_pts = series.get(f"{base}/Supply Current", [])
+        vlt_pts = series.get(f"{base}/Out Volt", [])
+
+        per_state = {}
+        for s in INTAKE_STATES:
+            ivs = state_intervals[s]
+            per_state[s] = {
+                "stator": time_weighted_abs_stats(cst_pts, ivs, t_end),
+                "supply": time_weighted_abs_stats(sup_pts, ivs, t_end),
+                "speed":  time_weighted_abs_stats(spd_pts, ivs, t_end),
+            }
+        motor_stats[label] = per_state
+        motor_totals[label] = {
+            "stator": time_weighted_abs_stats(cst_pts, enabled_intervals, t_end),
+            "supply": time_weighted_abs_stats(sup_pts, enabled_intervals, t_end),
+            "speed":  time_weighted_abs_stats(spd_pts, enabled_intervals, t_end),
+        }
+        motor_energy[label] = energy_over_intervals(vlt_pts, cst_pts,
+                                                     enabled_intervals, t_end)
+
+    # Robot jam count (rising edges of Intake Jam within enabled time)
+    robot_jam_edges = count_rising_edges(jam_pts, enabled_intervals)
+
+    # Total seconds the robot's Intake Jam bool was True (during enabled)
+    robot_jam_time = 0.0
+    prev_ts = None
+    prev_val = None
+    for ts, v in jam_pts:
+        if prev_ts is not None and prev_val:
+            robot_jam_time += overlap_with_intervals(prev_ts, ts, enabled_intervals)
+        prev_ts = ts
+        prev_val = bool(v)
+    if prev_ts is not None and prev_val:
+        robot_jam_time += overlap_with_intervals(prev_ts, t_end, enabled_intervals)
+
+    # Custom jam events
+    custom_jams = detect_custom_jams(series, state_pts, enabled_intervals, t_end)
+
+    result = {
+        "log_path":         log_path,
+        "session_len":      t_end,
+        "enabled_s":        enabled_s,
+        "state_secs":       state_secs,
+        "motor_stats":      motor_stats,
+        "motor_totals":     motor_totals,
+        "motor_energy_J":   motor_energy,
+        "robot_jam_edges":  robot_jam_edges,
+        "robot_jam_time":   float(robot_jam_time),
+        "custom_jams":      custom_jams,
+    }
+    del series
+    return result
+
+# -- Report helpers --------------------------------------------------------------
+
+def _fmt_abs(s, unit=""):
+    if s is None:
+        return "(no samples)"
+    return (f"mean {s['mean_tw']:.1f}, p50 {s['p50']:.1f}, "
+            f"p95 {s['p95']:.1f}, max {s['max']:.1f} {unit} (n={s['n']})")
+
+def print_per_log_report(r):
+    print()
+    print(SEP)
+    print(f"  LOG: {os.path.basename(r['log_path'])}")
+    print(SEP)
+    print(f"  Enabled time : {r['enabled_s']:.1f} s")
+
+    # Time in each state
+    ss = r["state_secs"]
+    total = r["enabled_s"]
+    print(f"  State time   : "
+          + ", ".join(f"{s}={ss[s]:.1f}s ({100*ss[s]/total:.1f}%)"
+                       for s in INTAKE_STATES))
+
+    # Per-motor overall (all enabled time)
+    print()
+    print(f"  [Per-motor, all enabled time]")
+    print(f"  {'Motor':<14}  {'Stator (A)':<38}  {'Supply (A)':<38}  {'Speed (TPS)':<38}  {'Energy':>8}")
+    print(f"  {'-'*14}  {'-'*38}  {'-'*38}  {'-'*38}  {'-'*8}")
+    for label in list(INTAKE_MOTORS) + list(FEEDER_MOTORS):
+        t = r["motor_totals"][label]
+        e = r["motor_energy_J"][label]
+        st = _fmt_abs(t["stator"])
+        su = _fmt_abs(t["supply"])
+        sp = _fmt_abs(t["speed"])
+        print(f"  {label:<14}  {st:<38}  {su:<38}  {sp:<38}  {e:>6.0f} J")
+
+    # Per-motor per-state breakdown for intake motors only (most interesting)
+    for label in INTAKE_MOTORS:
+        print()
+        print(f"  [{label}] by state:")
+        print(f"    {'State':<10}  {'Stator (A)':<38}  {'Supply (A)':<38}  {'Speed (TPS)':<38}")
+        print(f"    {'-'*10}  {'-'*38}  {'-'*38}  {'-'*38}")
+        for s in INTAKE_STATES:
+            row = r["motor_stats"][label][s]
+            st = _fmt_abs(row["stator"])
+            su = _fmt_abs(row["supply"])
+            sp = _fmt_abs(row["speed"])
+            print(f"    {s:<10}  {st:<38}  {su:<38}  {sp:<38}")
+
+    # Jam comparison
+    print()
+    print(f"  [Jam detection]")
+    print(f"    Robot 'Intake Jam' rising edges : {r['robot_jam_edges']}  "
+          f"(True for {r['robot_jam_time']:.2f}s total)")
+    print(f"    Custom detector events          : {len(r['custom_jams'])}")
+    if r["custom_jams"]:
+        print(f"    {'#':>2}  {'t (s)':>7}  {'dur':>5}  {'type':<11}  "
+              f"{'state':<9}  {'peak I':>6}  {'min spd':>7}")
+        print(f"    {'-'*2}  {'-'*7}  {'-'*5}  {'-'*11}  "
+              f"{'-'*9}  {'-'*6}  {'-'*7}")
+        for i, e in enumerate(r["custom_jams"][:20], 1):
+            print(f"    {i:>2}  {e['t_start']:>7.2f}  {e['duration']:>4.2f}s  "
+                  f"{classify_jam(e):<11}  {e['state']:<9}  "
+                  f"{e['peak_current_A']:>5.1f}A  {e['min_speed_TPS']:>5.2f} TPS")
+        if len(r["custom_jams"]) > 20:
+            print(f"    ... {len(r['custom_jams']) - 20} more")
+
+# -- Combined analysis -----------------------------------------------------------
+
+def _merge_abs_stats(stats_list):
+    stats_list = [s for s in stats_list if s is not None]
+    if not stats_list:
+        return None
+    total_n = sum(s["n"] for s in stats_list)
+    if total_n == 0:
+        return None
+    return {
+        "n":       total_n,
+        "mean_tw": sum(s["mean_tw"] * s["n"] for s in stats_list) / total_n,
+        "p50":     float(np.median([s["p50"] for s in stats_list])),
+        "p95":     float(np.max([s["p95"] for s in stats_list])),
+        "max":     float(np.max([s["max"] for s in stats_list])),
+    }
+
+def print_combined_analysis(results):
+    n_logs = len(results)
+    print()
+    print(SEP)
+    print(f"  COMBINED INTAKE ANALYSIS ACROSS {n_logs} LOG{'S' if n_logs != 1 else ''}")
+    print(SEP)
+
+    total_enabled = sum(r["enabled_s"] for r in results)
+    print(f"\n  Total enabled time  : {total_enabled:.1f} s  "
+          f"({total_enabled/60:.2f} min)")
+
+    # State-time aggregates
+    state_totals = {s: sum(r["state_secs"].get(s, 0.0) for r in results)
+                    for s in INTAKE_STATES}
+    print(f"  State time totals   : "
+          + ", ".join(f"{s}={state_totals[s]:.1f}s "
+                       f"({100*state_totals[s]/total_enabled:.1f}%)"
+                       for s in INTAKE_STATES))
+
+    # Per-motor season totals (all enabled time)
+    print()
+    print(f"  [Per-motor season totals, all enabled time]")
+    print(f"  {'Motor':<14}  {'Stator mean/p95/max':<28}  "
+          f"{'Supply mean/p95/max':<28}  {'|Speed| mean/p95/max':<28}  {'Energy':>9}")
+    print(f"  {'-'*14}  {'-'*28}  {'-'*28}  {'-'*28}  {'-'*9}")
+    for label in list(INTAKE_MOTORS) + list(FEEDER_MOTORS):
+        s_st = _merge_abs_stats([r["motor_totals"][label]["stator"] for r in results])
+        s_su = _merge_abs_stats([r["motor_totals"][label]["supply"] for r in results])
+        s_sp = _merge_abs_stats([r["motor_totals"][label]["speed"]  for r in results])
+        def _short(s, unit=""):
+            return (f"{s['mean_tw']:.1f}/{s['p95']:.1f}/{s['max']:.1f}{unit}"
+                    if s else "-")
+        total_e = sum(r["motor_energy_J"][label] for r in results)
+        print(f"  {label:<14}  {_short(s_st, ' A'):<28}  "
+              f"{_short(s_su, ' A'):<28}  {_short(s_sp):<28}  {total_e/1000:>7.2f} kJ")
+
+    # Per-motor, per-state breakdown for INTAKE motors
+    for label in INTAKE_MOTORS:
+        print()
+        print(f"  [{label}] by state (season):")
+        print(f"    {'State':<10}  {'Stator (A)':<30}  "
+              f"{'Supply (A)':<30}  {'|Speed|':<30}")
+        print(f"    {'-'*10}  {'-'*30}  {'-'*30}  {'-'*30}")
+        for s in INTAKE_STATES:
+            st = _merge_abs_stats([r["motor_stats"][label][s]["stator"] for r in results])
+            su = _merge_abs_stats([r["motor_stats"][label][s]["supply"] for r in results])
+            sp = _merge_abs_stats([r["motor_stats"][label][s]["speed"]  for r in results])
+            def _short(s):
+                return (f"mean {s['mean_tw']:.1f}, p95 {s['p95']:.1f}, max {s['max']:.1f}"
+                        if s else "-")
+            print(f"    {s:<10}  {_short(st):<30}  {_short(su):<30}  {_short(sp):<30}")
+
+    # Jam detection summary
+    print()
+    print(SEP)
+    print("  JAM DETECTION — robot vs custom")
+    print(SEP)
+    robot_total = sum(r["robot_jam_edges"] for r in results)
+    robot_time  = sum(r["robot_jam_time"]  for r in results)
+    print(f"\n  Robot 'Intake Jam' rising edges (season) : {robot_total}  "
+          f"(avg {robot_total/n_logs:.1f}/match)")
+    print(f"  Robot jam bool True time (season)        : {robot_time:.2f}s  "
+          f"({100*robot_time/total_enabled:.2f}% of enabled)")
+    print(f"  Robot detector: current >= {ROBOT_JAM_CURRENT_A:.0f}A AND "
+          f"speed < {ROBOT_JAM_SPEED_TPS:.0f} TPS on LEFT INTAKE only; "
+          f"no debounce, no cooldown")
+
+    all_custom = []
+    for r in results:
+        match = os.path.basename(r["log_path"])
+        for e in r["custom_jams"]:
+            all_custom.append({**e, "match": match})
+    print(f"\n  Custom detector events (season) : {len(all_custom)}  "
+          f"(avg {len(all_custom)/n_logs:.1f}/match)")
+    print(f"  Custom detector: |stator| >= {CUSTOM_STALL_CURRENT_A:.0f}A AND "
+          f"|speed| < {CUSTOM_STALL_SPEED_TPS:.1f} TPS AND "
+          f"|reqSpeed| >= {CUSTOM_MIN_REQ_SPEED:.1f} TPS,")
+    print(f"                  held for {CUSTOM_MIN_DURATION_S:.2f}s min, "
+          f"cleared after {CUSTOM_CLEAR_DURATION_S:.2f}s recovery, "
+          f"{CUSTOM_COOLDOWN_S:.2f}s cooldown")
+
+    # Breakdown by type + state
+    if all_custom:
+        by_type = defaultdict(int)
+        by_state = defaultdict(int)
+        by_type_state = defaultdict(int)
+        for e in all_custom:
+            t = classify_jam(e); s = e["state"]
+            by_type[t]  += 1
+            by_state[s] += 1
+            by_type_state[(t, s)] += 1
+        print()
+        print(f"  Custom jam events by motor(s):")
+        for t in ("LEFT_ONLY", "RIGHT_ONLY", "BOTH", "OTHER"):
+            if by_type[t]:
+                print(f"    {t:<10}  {by_type[t]:>4d}  ({100*by_type[t]/len(all_custom):.1f}%)")
+        print(f"\n  Custom jam events by state:")
+        for s in INTAKE_STATES + ["UNKNOWN"]:
+            if by_state[s]:
+                print(f"    {s:<10}  {by_state[s]:>4d}  ({100*by_state[s]/len(all_custom):.1f}%)")
+
+        # Longest / most-intense events
+        top = sorted(all_custom, key=lambda e: -e["duration"])[:10]
+        print(f"\n  Top {len(top)} longest jam events (season):")
+        print(f"  {'dur':>5}  {'peak I':>6}  {'min spd':>7}  {'type':<11}  "
+              f"{'state':<9}  {'t (s)':>7}  {'Match':<45}")
+        print(f"  {'-'*5}  {'-'*6}  {'-'*7}  {'-'*11}  {'-'*9}  {'-'*7}  {'-'*45}")
+        for e in top:
+            print(f"  {e['duration']:>4.2f}s  "
+                  f"{e['peak_current_A']:>5.1f}A  "
+                  f"{e['min_speed_TPS']:>5.2f}   "
+                  f"{classify_jam(e):<11}  {e['state']:<9}  "
+                  f"{e['t_start']:>7.2f}  {e['match']:<45}")
+
+    print()
+    print(SEP)
+
+# -- CLI / IO (same shape as other analysis scripts) -----------------------------
+
+def resolve_log_paths(args):
+    if not args:
+        return [DEFAULT_LOG]
+    def walk_dir(d):
+        found = []
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith(".wpilog"):
+                    found.append(os.path.join(root, f))
+        return sorted(found)
+    paths = []
+    for a in args:
+        if os.path.isdir(a):
+            paths.extend(walk_dir(a))
+            continue
+        hits = glob.glob(a) or [a]
+        for h in hits:
+            if os.path.isdir(h):
+                paths.extend(walk_dir(h))
+            elif os.path.isfile(h) and h.lower().endswith(".wpilog"):
+                paths.append(h)
+    seen, uniq = set(), []
+    for p in paths:
+        abs_p = os.path.abspath(p).replace("\\", "/")
+        if abs_p not in seen:
+            uniq.append(abs_p); seen.add(abs_p)
+    return uniq
+
+def parse_cli(argv):
+    reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+    summary_out = os.path.join(reports_dir, "intake_summary.md")
+    matches_out = os.path.join(reports_dir, "intake_matches.md")
+    write_file  = True
+    workers     = None
+    positional  = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-o", "--output", "--summary-out"):
+            summary_out = argv[i + 1]; write_file = True; i += 2
+        elif a == "--matches-out":
+            matches_out = argv[i + 1]; write_file = True; i += 2
+        elif a in ("-j", "--workers"):
+            workers = max(1, int(argv[i + 1])); i += 2
+        elif a == "--no-file":
+            write_file = False; i += 1
+        elif a == "--serial":
+            workers = 1; i += 1
+        else:
+            positional.append(a); i += 1
+    return positional, summary_out, matches_out, write_file, workers
+
+def write_markdown_report(title, captured_text, out_path, paths, extra_note=None):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"# {title}", "", f"_Generated: {now}_", "",
+        f"## Logs analyzed ({len(paths)})", "",
+    ]
+    for p in paths:
+        lines.append(f"- `{p}`")
+    if extra_note:
+        lines.extend(["", extra_note])
+    lines.extend(["", "## Analysis output", "", "```", captured_text.rstrip(), "```", ""])
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+def _worker(idx_path):
+    import gc
+    idx, p = idx_path
+    t0 = time.time()
+    r = analyze_log(p)
+    gc.collect()
+    return (idx, p, r, time.time() - t0)
+
+def _make_pool(workers):
+    kwargs = {"max_workers": workers}
+    if sys.version_info >= (3, 11):
+        kwargs["max_tasks_per_child"] = 1
+    return concurrent.futures.ProcessPoolExecutor(**kwargs)
+
+def load_all(paths, workers):
+    n = len(paths)
+    if workers is None:
+        workers = min(os.cpu_count() or 4, n)
+    workers = max(1, min(workers, n))
+    results_by_idx = {}
+    failed = []
+    if workers == 1:
+        progress("Loading logs serially ...")
+        for i, p in enumerate(paths):
+            t0 = time.time()
+            progress(f"[{i+1}/{n}] {os.path.basename(p)} ...")
+            r = analyze_log(p)
+            dt = time.time() - t0
+            if r is None:
+                failed.append(p); continue
+            results_by_idx[i] = r
+            progress(f"  done in {dt:.1f}s — {len(r['custom_jams'])} custom jams")
+        return [results_by_idx[i] for i in range(n) if i in results_by_idx], failed
+
+    progress(f"Loading {n} logs in parallel ({workers} workers) ...")
+    done = 0
+    ex = _make_pool(workers)
+    futures = {}
+    try:
+        futures = {ex.submit(_worker, (i, p)): i for i, p in enumerate(paths)}
+        for fut in concurrent.futures.as_completed(futures):
+            idx, p, r, dt = fut.result()
+            done += 1
+            if r is None:
+                progress(f"[{done}/{n}] {os.path.basename(p)} FAILED after {dt:.1f}s")
+                failed.append(p); continue
+            results_by_idx[idx] = r
+            progress(f"[{done}/{n}] {os.path.basename(p)} — {dt:.1f}s, "
+                     f"{len(r['custom_jams'])} custom jams")
+    except KeyboardInterrupt:
+        progress("Interrupted — cancelling remaining workers ...")
+        for f in futures:
+            f.cancel()
+        ex.shutdown(wait=True, cancel_futures=True)
+        raise
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+    return [results_by_idx[i] for i in range(n) if i in results_by_idx], failed
 
 def main():
-    series = load_series()
-
-    ts_ls,  l_speed    = to_np(series, L_SPEED)
-    ts_lsc, l_stator   = to_np(series, L_STATOR)
-    ts_lsp, l_supply   = to_np(series, L_SUPPLY)
-    ts_lv,  l_voltage  = to_np(series, L_VOLTAGE)
-    ts_lq,  l_req      = to_np(series, L_REQSPEED)
-    ts_rs,  r_speed    = to_np(series, R_SPEED)
-    ts_rsc, r_stator   = to_np(series, R_STATOR)
-    ts_rsp, r_supply   = to_np(series, R_SUPPLY)
-    ts_rv,  r_voltage  = to_np(series, R_VOLTAGE)
-    ts_rq,  r_req      = to_np(series, R_REQSPEED)
-    state_pts          = series.get(STATE_PATH, [])
-    jam_pts            = series.get(JAM_PATH, [])
-
-    if ts_ls is None or ts_rs is None:
-        print("ERROR: Intake motor speed data not found.")
+    t_overall = time.time()
+    positional, summary_out, matches_out, write_file, workers = parse_cli(sys.argv[1:])
+    paths = resolve_log_paths(positional)
+    if not paths:
+        sys.stderr.write("ERROR: no log files found.\n")
         sys.exit(1)
-    if not state_pts:
-        print("ERROR: Intake State data not found.")
-        sys.exit(1)
+    progress(f"Found {len(paths)} log{'s' if len(paths) != 1 else ''} to analyze")
+    results, failed = load_all(paths, workers)
+    progress(f"Loaded logs ({len(results)} ok, {len(failed)} failed)")
 
-    # -- Common time grid from all speed channels
-    ts_grid = np.unique(np.concatenate([ts_ls, ts_rs]))
-
-    ls_g    = interp_at(ts_grid, ts_ls,  l_speed)
-    lsc_g   = interp_at(ts_grid, ts_lsc, l_stator)  if ts_lsc is not None else np.zeros_like(ts_grid)
-    lsp_g   = interp_at(ts_grid, ts_lsp, l_supply)  if ts_lsp is not None else np.zeros_like(ts_grid)
-    lv_g    = interp_at(ts_grid, ts_lv,  l_voltage) if ts_lv  is not None else np.zeros_like(ts_grid)
-    lq_g    = interp_at(ts_grid, ts_lq,  l_req)     if ts_lq  is not None else np.zeros_like(ts_grid)
-    rs_g    = interp_at(ts_grid, ts_rs,  r_speed)
-    rsc_g   = interp_at(ts_grid, ts_rsc, r_stator)  if ts_rsc is not None else np.zeros_like(ts_grid)
-    rsp_g   = interp_at(ts_grid, ts_rsp, r_supply)  if ts_rsp is not None else np.zeros_like(ts_grid)
-    rv_g    = interp_at(ts_grid, ts_rv,  r_voltage) if ts_rv  is not None else np.zeros_like(ts_grid)
-    rq_g    = interp_at(ts_grid, ts_rq,  r_req)     if ts_rq  is not None else np.zeros_like(ts_grid)
-
-    # Power per motor = |V| * |I_stator|, then sum
-    power_L   = np.abs(lv_g) * np.abs(lsc_g)
-    power_R   = np.abs(rv_g) * np.abs(rsc_g)
-    power_tot = power_L + power_R
-
-    stator_tot = np.abs(lsc_g) + np.abs(rsc_g)
-    supply_tot = np.abs(lsp_g) + np.abs(rsp_g)
-
-    t0 = ts_grid[0]
-
-    # -- Session totals
-    session_len    = ts_grid[-1] - t0
-    total_energy_J = float(np.trapezoid(power_tot, ts_grid))
-    max_speed_L    = float(np.max(np.abs(ls_g)))
-    max_speed_R    = float(np.max(np.abs(rs_g)))
-
-    # -- State distribution (time in each state)
-    state_time = Counter()
-    for i in range(len(state_pts) - 1):
-        ts, val = state_pts[i]
-        nxt     = state_pts[i + 1][0]
-        state_time[val] += (nxt - ts)
-    if state_pts:
-        last_ts, last_val = state_pts[-1]
-        state_time[last_val] += max(0.0, ts_grid[-1] - last_ts)
-
-    # -- INTAKING cycles
-    intaking_windows = find_state_windows(state_pts, "INTAKING")
-    shooting_windows = find_state_windows(state_pts, "SHOOTING")
-
-    cycles = []
-    for t_start, t_end in intaking_windows:
-        dur     = t_end - t_start
-        E_cyc   = energy_in_window(ts_grid, power_tot, t_start, t_end)
-        I_stat_avg = mean_in_window(ts_grid, stator_tot, t_start, t_end)
-        I_stat_pk  = peak_in_window(ts_grid, stator_tot, t_start, t_end)
-        I_sup_avg  = mean_in_window(ts_grid, supply_tot, t_start, t_end)
-        I_sup_pk   = peak_in_window(ts_grid, supply_tot, t_start, t_end)
-
-        # Did motors actually reach target speed?
-        mask = (ts_grid >= t_start) & (ts_grid <= t_end)
-        if mask.sum() > 1:
-            req_median = float(np.median(lq_g[mask][lq_g[mask] > 0])) if np.any(lq_g[mask] > 0) else 0.0
-            actual_L_avg = float(np.mean(np.abs(ls_g[mask])))
-            actual_R_avg = float(np.mean(np.abs(rs_g[mask])))
-            reached = (req_median > 0 and
-                       actual_L_avg >= AT_SPEED_FRACTION * abs(req_median) and
-                       actual_R_avg >= AT_SPEED_FRACTION * abs(req_median))
-            stalled = (req_median > 0 and
-                       (actual_L_avg < STALL_FRACTION * abs(req_median) or
-                        actual_R_avg < STALL_FRACTION * abs(req_median)))
-        else:
-            req_median = 0.0
-            actual_L_avg = 0.0
-            actual_R_avg = 0.0
-            reached = False
-            stalled = False
-
-        jam_count = count_jams_in_window(jam_pts, t_start, t_end)
-
-        cycles.append({
-            "t_start":    t_start,
-            "t_end":      t_end,
-            "dur":        dur,
-            "req_rps":    req_median,
-            "act_L":      actual_L_avg,
-            "act_R":      actual_R_avg,
-            "E_J":        E_cyc,
-            "I_stat_avg": I_stat_avg,
-            "I_stat_pk":  I_stat_pk,
-            "I_sup_avg":  I_sup_avg,
-            "I_sup_pk":   I_sup_pk,
-            "reached":    reached,
-            "stalled":    stalled,
-            "jams":       jam_count,
-        })
-
-    # -- Total jam events (rising edges across whole log)
-    total_jams = 0
-    prev       = None
-    for ts, val in jam_pts:
-        v = bool(val)
-        if prev is not None and (not prev) and v:
-            total_jams += 1
-        prev = v
-
-    # -- Report ------------------------------------------------------------------
-    SEP = "-" * 72
-
-    print()
-    print(SEP)
-    print("  INTAKE ANALYSIS  --  FRC Team Valor 6800")
-    print(SEP)
-    print(f"\n  Log duration            : {session_len:.1f} s  ({session_len/60:.2f} min)")
-    print(f"  Peak speed (Left/Right) : {max_speed_L:.1f} / {max_speed_R:.1f} RPS")
-    print(f"  Total intake energy     : {total_energy_J/1000:.2f} kJ")
-    print(f"  Total jam events        : {total_jams}  (rising edges of Intake Jam)")
-    print(f"  INTAKING cycles         : {len(intaking_windows)}")
-    print(f"  SHOOTING cycles         : {len(shooting_windows)}")
-
-    # -- Time distribution in each state
-    print()
-    print(f"  Time in each Intake State:")
-    print(f"  {'State':>12}  {'Time (s)':>10}  {'% of log':>8}")
-    print(f"  {'-'*12}  {'-'*10}  {'-'*8}")
-    for st in ("OFF", "INTAKING", "SHOOTING"):
-        t = state_time.get(st, 0.0)
-        print(f"  {st:>12}  {t:>10.1f}  {100*t/session_len:>7.1f}%")
-
-    # -- Overall current draw
-    print()
-    print(f"  {'Current draw':35s}  {'Mean (A)':>9}  {'Peak (A)':>9}")
-    print(f"  {'-'*35}  {'-'*9}  {'-'*9}")
-    print(f"  {'Left  stator':35s}  {np.mean(np.abs(lsc_g)):>9.1f}  {np.max(np.abs(lsc_g)):>9.1f}")
-    print(f"  {'Right stator':35s}  {np.mean(np.abs(rsc_g)):>9.1f}  {np.max(np.abs(rsc_g)):>9.1f}")
-    print(f"  {'Combined stator':35s}  {np.mean(stator_tot):>9.1f}  {np.max(stator_tot):>9.1f}")
-    print(f"  {'Left  supply':35s}  {np.mean(np.abs(lsp_g)):>9.1f}  {np.max(np.abs(lsp_g)):>9.1f}")
-    print(f"  {'Right supply':35s}  {np.mean(np.abs(rsp_g)):>9.1f}  {np.max(np.abs(rsp_g)):>9.1f}")
-    print(f"  {'Combined supply':35s}  {np.mean(supply_tot):>9.1f}  {np.max(supply_tot):>9.1f}")
-
-    # -- Per-cycle INTAKING table
-    print()
-    print(f"  INTAKING cycles (state=INTAKING):")
-    print()
-    print(f"  {'#':>2}  {'Start':>7}  {'End':>7}  {'Dur':>5}  "
-          f"{'Req':>5}  {'ActL':>5}  {'ActR':>5}  {'OK?':>4}  "
-          f"{'Is_avg':>7}  {'Is_pk':>6}  {'Ip_avg':>7}  {'Ip_pk':>6}  "
-          f"{'E (J)':>6}  {'Jam':>3}")
-    print(f"  {'-'*2}  {'-'*7}  {'-'*7}  {'-'*5}  "
-          f"{'-'*5}  {'-'*5}  {'-'*5}  {'-'*4}  "
-          f"{'-'*7}  {'-'*6}  {'-'*7}  {'-'*6}  "
-          f"{'-'*6}  {'-'*3}")
-
-    for i, c in enumerate(cycles):
-        if c["stalled"]:
-            ok = "STAL"
-        elif c["reached"]:
-            ok = "YES"
-        elif c["req_rps"] == 0:
-            ok = "n/a"
-        else:
-            ok = "no"
-        print(f"  {i+1:>2}  {c['t_start']:>7.1f}  {c['t_end']:>7.1f}  "
-              f"{c['dur']:>4.2f}s  "
-              f"{c['req_rps']:>5.1f}  {c['act_L']:>5.1f}  {c['act_R']:>5.1f}  {ok:>4}  "
-              f"{c['I_stat_avg']:>7.1f}  {c['I_stat_pk']:>6.1f}  "
-              f"{c['I_sup_avg']:>7.1f}  {c['I_sup_pk']:>6.1f}  "
-              f"{c['E_J']:>6.1f}  {c['jams']:>3d}")
-
-    # -- Aggregated cycle stats
-    print()
-    if cycles:
-        dur_arr   = np.array([c["dur"] for c in cycles])
-        E_arr     = np.array([c["E_J"] for c in cycles])
-        Istat_avg = np.array([c["I_stat_avg"] for c in cycles])
-        Istat_pk  = np.array([c["I_stat_pk"]  for c in cycles])
-        Isup_avg  = np.array([c["I_sup_avg"]  for c in cycles])
-        Isup_pk   = np.array([c["I_sup_pk"]   for c in cycles])
-        n_reached = sum(1 for c in cycles if c["reached"])
-        n_stalled = sum(1 for c in cycles if c["stalled"])
-        n_jammed  = sum(1 for c in cycles if c["jams"] > 0)
-
-        print(f"  Cycles reaching {int(AT_SPEED_FRACTION*100)}% of reqSpeed: {n_reached} / {len(cycles)}")
-        print(f"  Cycles with stall (<{int(STALL_FRACTION*100)}% reqSpeed): {n_stalled}")
-        print(f"  Cycles with at least one jam event: {n_jammed}")
-        print()
-        print(f"  Avg INTAKING duration  : {np.mean(dur_arr):.2f} s  "
-              f"(min {np.min(dur_arr):.2f}, max {np.max(dur_arr):.2f})")
-        print(f"  Avg energy per intake  : {np.mean(E_arr):.1f} J  "
-              f"(min {np.min(E_arr):.1f}, max {np.max(E_arr):.1f})")
-        print(f"  Avg stator current     : {np.mean(Istat_avg):.1f} A  "
-              f"(peak up to {np.max(Istat_pk):.1f} A)")
-        print(f"  Avg supply current     : {np.mean(Isup_avg):.1f} A  "
-              f"(peak up to {np.max(Isup_pk):.1f} A)")
-
-    # -- Jam analysis section ---------------------------------------------------
-    print()
-    print(SEP)
-    print("  JAM ANALYSIS")
-    print(SEP)
-
-    if jam_pts:
-        # Compute time spent in jammed state
-        jam_time  = 0.0
-        jam_edges = []
-        prev_ts   = None
-        prev_val  = None
-        for ts, val in jam_pts:
-            if prev_val is True and prev_ts is not None:
-                jam_time += (ts - prev_ts)
-            if prev_val is not True and val is True:
-                jam_edges.append(ts)
-            prev_ts  = ts
-            prev_val = bool(val)
-
-        print(f"\n  Total jam events (rising edges): {len(jam_edges)}")
-        print(f"  Total time in jammed state     : {jam_time:.1f} s  "
-              f"({100*jam_time/session_len:.1f}% of log)")
-        if jam_edges:
-            print(f"  Jam events (timestamp / intake cycle #):")
-            print(f"  {'Time (s)':>9}  {'During Cycle':>13}  {'State at t':>11}")
-            print(f"  {'-'*9}  {'-'*13}  {'-'*11}")
-            for t_jam in jam_edges:
-                # Locate which cycle (if any) we're in at this moment
-                cyc_idx = next((i + 1 for i, c in enumerate(cycles)
-                                if c["t_start"] <= t_jam <= c["t_end"]), None)
-                # State at that time
-                st = next((v for (ts, v) in reversed(state_pts) if ts <= t_jam), "?")
-                cyc_str = f"#{cyc_idx}" if cyc_idx else "-"
-                print(f"  {t_jam:>9.2f}  {cyc_str:>13}  {st:>11}")
-    else:
-        print("\n  No Intake Jam data found.")
-
-    # -- SHOOTING state analysis ------------------------------------------------
-    print()
-    print(SEP)
-    print("  SHOOTING STATE (feeder running into flywheel)")
-    print(SEP)
-
-    if shooting_windows:
-        shoot_E    = []
-        shoot_dur  = []
-        shoot_I    = []
-        for ts, te in shooting_windows:
-            shoot_dur.append(te - ts)
-            shoot_E.append(energy_in_window(ts_grid, power_tot, ts, te))
-            shoot_I.append(mean_in_window(ts_grid, stator_tot, ts, te))
-
-        shoot_dur = np.array(shoot_dur)
-        shoot_E   = np.array(shoot_E)
-        shoot_I   = np.array(shoot_I)
-
-        print(f"\n  SHOOTING windows     : {len(shooting_windows)}")
-        print(f"  Avg duration         : {np.mean(shoot_dur):.2f} s  "
-              f"(min {np.min(shoot_dur):.2f}, max {np.max(shoot_dur):.2f})")
-        print(f"  Avg energy (intake)  : {np.mean(shoot_E):.1f} J  "
-              f"(min {np.min(shoot_E):.1f}, max {np.max(shoot_E):.1f})")
-        print(f"  Avg stator current   : {np.mean(shoot_I):.1f} A")
-
-    print()
-    print(SEP)
+    matches_buf = io.StringIO()
+    summary_buf = io.StringIO()
+    with contextlib.redirect_stdout(matches_buf):
+        print(f"Analyzing {len(paths)} log{'s' if len(paths) != 1 else ''}:")
+        for p in paths:
+            print(f"  - {p}")
+        for p in failed:
+            print(f"\nWARNING: no intake data in {p}.")
+        for r in results:
+            print_per_log_report(r)
+    if results:
+        with contextlib.redirect_stdout(summary_buf):
+            print_combined_analysis(results)
+    sys.stdout.write(matches_buf.getvalue())
+    sys.stdout.write(summary_buf.getvalue())
+    sys.stdout.flush()
+    if write_file:
+        progress(f"Writing per-match report to {matches_out} ...")
+        write_markdown_report("Intake Analysis — Per-Match Breakdown",
+                              matches_buf.getvalue(), matches_out, paths,
+                              extra_note="Season summary is in the companion summary file.")
+        progress(f"Writing summary report to {summary_out} ...")
+        write_markdown_report("Intake Analysis — Season Summary",
+                              summary_buf.getvalue(), summary_out, paths,
+                              extra_note="Per-match breakdowns are in the companion matches file.")
+        sys.stdout.write(
+            f"\nMarkdown reports written to:\n"
+            f"  summary : {summary_out}\n"
+            f"  matches : {matches_out}\n"
+        )
+    progress(f"Done. Total elapsed: {time.time() - t_overall:.1f}s")
 
 
 if __name__ == "__main__":
