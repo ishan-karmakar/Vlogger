@@ -67,10 +67,10 @@ AMBIGUITY_THRESHOLD = 0.2    # Drivetrain.cpp:118 (overrides header default of 0
 MAX_LATENCY_MS      = 2000.0 # default AprilTagsSensor::Config.maxMeasurementAge
 FIELD_BORDER_M      = 0.5    # default AprilTagsSensor::Config.fieldBorderMargin
 MAX_VISION_DIST_M   = 5.0    # Drivetrain.cpp: MAX_VISION_MEASUREMENT
-# WPILib AprilTagField::k2026RebuiltAndyMark (2026 REEFSCAPE). Adjust if the
-# season's field rebuild changes dimensions.
-FIELD_LENGTH_M      = 17.548
-FIELD_WIDTH_M       = 8.052
+# Field dimensions sourced from robot constants
+# (src/main/include/constants/Constants.h -> Constants::GameSpecific)
+FIELD_LENGTH_M      = 16.54
+FIELD_WIDTH_M       = 8.07
 
 # botpose array indices (both botpose_wpiblue and botpose_orb_wpiblue)
 BP_X = 0; BP_Y = 1; BP_YAW = 5; BP_LATENCY_MS = 6; BP_TAG_COUNT = 7; BP_AVG_DIST = 9
@@ -87,6 +87,73 @@ REJECTION_REASONS = [
     "TOO_FAR",         # avg tag distance >= 5.0m
 ]
 
+# -------------------------------------------------------------------------------
+# Tag -> field zone mapping (2026 season, k2026RebuiltAndyMark).
+#
+# Canonical team mapping provided by driver/operator — keep this as the single
+# source of truth so analysis labels match what the drive team calls each
+# structure.  Update here when the mapping changes season-to-season.
+#
+# Each entry is: tag_id -> (zone_name, owning_alliance)
+#   zone_name:  "Tower" / "Outpost" / "Left Trench" / "Right Trench" / "Hub"
+#   alliance:   "red" / "blue"  (which alliance the tag belongs to, NOT our
+#               alliance this match — use `alliance_is_red` to find that)
+# -------------------------------------------------------------------------------
+TAG_ZONES = {
+    # --- RED alliance tags ---
+    15: ("Tower",       "red"),
+    16: ("Tower",       "red"),
+    13: ("Outpost",     "red"),
+    14: ("Outpost",     "red"),
+    6:  ("Left Trench", "red"),
+    7:  ("Left Trench", "red"),
+    12: ("Right Trench","red"),
+    1:  ("Right Trench","red"),
+    9:  ("Hub",         "red"),
+    10: ("Hub",         "red"),
+    8:  ("Hub",         "red"),
+    5:  ("Hub",         "red"),
+    11: ("Hub",         "red"),
+    2:  ("Hub",         "red"),
+    4:  ("Hub",         "red"),
+    3:  ("Hub",         "red"),
+    # --- BLUE alliance tags ---
+    31: ("Tower",       "blue"),
+    32: ("Tower",       "blue"),
+    29: ("Outpost",     "blue"),
+    30: ("Outpost",     "blue"),
+    22: ("Left Trench", "blue"),
+    23: ("Left Trench", "blue"),
+    17: ("Right Trench","blue"),
+    28: ("Right Trench","blue"),
+    25: ("Hub",         "blue"),
+    26: ("Hub",         "blue"),
+    18: ("Hub",         "blue"),
+    27: ("Hub",         "blue"),
+    21: ("Hub",         "blue"),
+    24: ("Hub",         "blue"),
+    19: ("Hub",         "blue"),
+    20: ("Hub",         "blue"),
+}
+
+# Ordered list used for zone-summary tables (consistent column ordering)
+ZONE_ORDER = ["Hub", "Tower", "Outpost", "Left Trench", "Right Trench", "UNKNOWN"]
+
+def zone_for(tag_id):
+    """Return ('ZONE_NAME', 'alliance') or ('UNKNOWN', '-') if not mapped."""
+    return TAG_ZONES.get(int(tag_id), ("UNKNOWN", "-"))
+
+# -------------------------------------------------------------------------------
+# Zone-only tags — these AprilTags are positioned such that they're only ever
+# within line-of-sight while the robot is physically in its own alliance half.
+# If we see any of these, we can infer which alliance we were on even when FMS
+# data is absent/unreliable (pre-match boot, unsynced logs, practice matches).
+# -------------------------------------------------------------------------------
+ZONE_ONLY_TAGS = {
+    "red":  {7, 9, 10, 12},
+    "blue": {23, 25, 26, 28},
+}
+
 # Regex pulls only the fields we need (raw LL keys + team SmartDashboard keys)
 JS_REGEX_PARTS = []
 for cam in CAMERAS:
@@ -99,7 +166,14 @@ for cam in CAMERAS:
         rf"Doubts/(Rotational|Translational)|"
         rf"Field Calibration/Distance to Tag|tid)"
     )
+# Add FMS alliance + control-data (for FMS-attached bit) + DS mode signals
+JS_REGEX_PARTS.append(r"NT:/FMSInfo/(IsRedAlliance|FMSControlData)")
 LL_REGEX = r"(" + "|".join(JS_REGEX_PARTS) + r"|DS:(enabled|autonomous))"
+
+# Bit positions in NT:/FMSInfo/FMSControlData (from WPILib DriverStation).
+# Layout: bit0=enabled, bit1=autonomous, bit2=test, bit3=emergencyStop,
+#         bit4=FMSAttached, bit5=DSAttached
+FMS_ATTACHED_BIT = 1 << 4
 
 SEP = "-" * 72
 
@@ -343,12 +417,23 @@ def classify_rejections(botpose_pts, rawfid_pts, active_pts, tv_pts, intervals):
     order as AprilTagsSensor::applyVisionMeasurement() + Drivetrain.cpp's
     distance wrapper.
 
-    Returns a dict keyed by reason (PASS / NOT_ACTIVE / NO_TARGET / ...) with
-    the frame counts.
+    Returns (counts, accepted) where:
+      counts   -> dict keyed by reason (PASS / NOT_ACTIVE / NO_TARGET / ...)
+      accepted -> dict of parallel lists collected only for PASS frames:
+                    tag_counts[], distances[], latencies[],
+                    amb_means[]  (mean ambiguity across all tags in frame),
+                    amb_maxes[]  (max ambiguity across all tags in frame)
     """
-    counts = defaultdict(int)
+    counts   = defaultdict(int)
+    accepted = {
+        "tag_counts": [],
+        "distances":  [],
+        "latencies":  [],
+        "amb_means":  [],
+        "amb_maxes":  [],
+    }
     if not botpose_pts:
-        return dict(counts)
+        return dict(counts), accepted
 
     active_ts, active_v = _build_searchable(active_pts, lambda v: bool(v))
     tv_ts,     tv_v     = _build_searchable(tv_pts,     lambda v: bool(v))
@@ -393,8 +478,8 @@ def classify_rejections(botpose_pts, rawfid_pts, active_pts, tv_pts, intervals):
             counts["OUT_OF_FIELD"] += 1
             continue
         # Gate 6: MT1 single-tag ambiguity rejection
+        raw = _lookup_at(ts, raw_ts, raw_v, default=None)
         if tag_count == 1:
-            raw = _lookup_at(ts, raw_ts, raw_v, default=None)
             if isinstance(raw, list) and len(raw) >= RAWFID_STRIDE:
                 try:
                     amb = float(raw[6])
@@ -408,11 +493,81 @@ def classify_rejections(botpose_pts, rawfid_pts, active_pts, tv_pts, intervals):
             counts["TOO_FAR"] += 1
             continue
 
+        # PASS — collect per-frame stats for the "accepted measurements" summary.
         counts["PASS"] += 1
+        accepted["tag_counts"].append(tag_count)
+        accepted["distances"].append(avg_dist)
+        accepted["latencies"].append(latency_ms)
+        # Pull ambiguities from rawfiducials groups-of-7 for the full frame
+        if isinstance(raw, list) and len(raw) >= RAWFID_STRIDE:
+            ambs = []
+            for g in range(len(raw) // RAWFID_STRIDE):
+                try:
+                    ambs.append(float(raw[g * RAWFID_STRIDE + 6]))
+                except (TypeError, ValueError):
+                    pass
+            if ambs:
+                accepted["amb_means"].append(float(np.mean(ambs)))
+                accepted["amb_maxes"].append(float(np.max(ambs)))
 
-    return dict(counts)
+    return dict(counts), accepted
 
 # -- Per-log analysis ------------------------------------------------------------
+
+def detect_alliance(series, tag_summary):
+    """
+    Determine our alliance with a three-tier strategy:
+
+    1. FMS-gated IsRedAlliance -- only samples taken while BOTH the FMS
+       was attached (FMSControlData bit 4 set) AND the robot was enabled
+       (DS:enabled == True) are considered valid. FMSInfo/IsRedAlliance
+       defaults to False pre-connect and may revert to False post-connect,
+       so ungated sampling is unreliable.
+    2. Zone-only tags -- count frame-sightings of tags only visible from
+       a specific alliance zone. Side with 3x the opposing hits wins.
+    3. None if neither is conclusive.
+
+    Returns ('red' | 'blue' | None, source_label) where source_label is
+    'fms' / 'zone-tags' / 'none'.
+    """
+    red_pts   = series.get("NT:/FMSInfo/IsRedAlliance", [])
+    ctrl_pts  = series.get("NT:/FMSInfo/FMSControlData", [])
+    en_pts    = series.get("DS:enabled", [])
+
+    # Build step functions for the three signals. IsRedAlliance only changes
+    # when FMS writes a new alliance (so typically logged once early in the
+    # match, even before enable). Looking up at sample time is wrong — we
+    # need to snapshot the alliance at the first moment BOTH FMS is attached
+    # AND the robot is enabled.
+    fms_ts,  fms_v  = _build_searchable(
+        ctrl_pts, lambda v: bool(int(v) & FMS_ATTACHED_BIT))
+    en_ts,   en_v   = _build_searchable(en_pts,  lambda v: bool(v))
+    red_ts,  red_v  = _build_searchable(red_pts, lambda v: bool(v))
+
+    # Walk the union of transition timestamps and find the first where both
+    # are True. Alliance doesn't change mid-match, so one sample is enough.
+    transitions = sorted(set(list(fms_ts) + list(en_ts)))
+    for ts in transitions:
+        fms_on = _lookup_at(ts, fms_ts, fms_v, default=False)
+        ena    = _lookup_at(ts, en_ts,  en_v,  default=False)
+        if fms_on and ena:
+            # Snapshot IsRedAlliance at this moment
+            red = _lookup_at(ts, red_ts, red_v, default=None)
+            if red is not None:
+                return ("red" if red else "blue"), "fms"
+            break  # No IsRedAlliance logged yet at this point — fall through
+
+    # FMS/enabled gate didn't yield samples — fall back to tag-based inference.
+    red_hits  = sum(tag_summary.get(t, {}).get("frames", 0)
+                    for t in ZONE_ONLY_TAGS["red"])
+    blue_hits = sum(tag_summary.get(t, {}).get("frames", 0)
+                    for t in ZONE_ONLY_TAGS["blue"])
+    if red_hits > 3 * max(1, blue_hits):
+        return "red", "zone-tags"
+    if blue_hits > 3 * max(1, red_hits):
+        return "blue", "zone-tags"
+
+    return None, "none"
 
 def analyze_log(log_path):
     series = load_series(log_path)
@@ -459,7 +614,7 @@ def analyze_log(log_path):
 
         # Classify every vision frame against the team's filter gates
         botpose_pts = series.get(f"NT:/{cam}/botpose_wpiblue", [])
-        rejections = classify_rejections(
+        rejections, accepted = classify_rejections(
             botpose_pts, raw_pts, active_pts, tv_bool_pts, enabled_intervals
         )
 
@@ -491,6 +646,7 @@ def analyze_log(log_path):
             "active_frac":     time_fraction_true(active_pts,  enabled_intervals, t_end),
             "per_tag":         per_tag_cam,
             "rejections":      rejections,
+            "accepted":        accepted,
         }
 
     # Collapse per-tag aggregates: weight by frame count
@@ -515,17 +671,70 @@ def analyze_log(log_path):
             "cameras":   sorted(g["cameras"]),
         }
 
+    # Detect alliance AFTER tag_summary is built, so we can fall back to
+    # zone-only tag inference if FMS data is missing/unreliable.
+    alliance, alliance_source = detect_alliance(series, tag_summary)
+
     result = {
-        "log_path":      log_path,
-        "session_len":   t_end,
-        "enabled_s":     enabled_s,
-        "cameras":       per_cam,
-        "tags":          tag_summary,
+        "log_path":         log_path,
+        "session_len":      t_end,
+        "enabled_s":        enabled_s,
+        "alliance":         alliance,          # 'red' / 'blue' / None
+        "alliance_source":  alliance_source,   # 'fms' / 'zone-tags' / 'none'
+        "cameras":          per_cam,
+        "tags":             tag_summary,
     }
     del series
     return result
 
 # -- Per-log report --------------------------------------------------------------
+
+def _summarize_accepted(accepted):
+    """Turn the per-accepted-frame lists into a small dict of summary stats."""
+    n = len(accepted["tag_counts"])
+    if n == 0:
+        return None
+    tc    = np.array(accepted["tag_counts"])
+    dist  = np.array(accepted["distances"])
+    lat   = np.array(accepted["latencies"])
+    a_mean = np.array(accepted["amb_means"]) if accepted["amb_means"] else np.array([])
+    a_max  = np.array(accepted["amb_maxes"]) if accepted["amb_maxes"] else np.array([])
+    return {
+        "n":             n,
+        "single_tag":    int((tc == 1).sum()),
+        "multi_tag":     int((tc >  1).sum()),
+        "max_tag_count": int(tc.max()),
+        "dist_mean":     float(dist.mean()),
+        "dist_p50":      float(np.percentile(dist, 50)),
+        "dist_p95":      float(np.percentile(dist, 95)),
+        "dist_max":      float(dist.max()),
+        "lat_mean":      float(lat.mean()),
+        "lat_p50":       float(np.percentile(lat, 50)),
+        "lat_p95":       float(np.percentile(lat, 95)),
+        "lat_max":       float(lat.max()),
+        "amb_mean":      float(a_mean.mean()) if len(a_mean) else None,
+        "amb_p95":       float(np.percentile(a_mean, 95)) if len(a_mean) else None,
+        "amb_max":       float(a_max.max())   if len(a_max)  else None,
+    }
+
+def _print_accepted_block(a, indent="    "):
+    """Print the 'accepted measurements' summary block given summarize output."""
+    if a is None:
+        print(f"{indent}Accepted measurements : (none)")
+        return
+    pct_single = 100.0 * a["single_tag"] / a["n"]
+    pct_multi  = 100.0 * a["multi_tag"]  / a["n"]
+    print(f"{indent}Accepted measurements : n={a['n']}  "
+          f"(single-tag {a['single_tag']}/{pct_single:.1f}%, "
+          f"multi-tag {a['multi_tag']}/{pct_multi:.1f}%, "
+          f"max tags {a['max_tag_count']})")
+    print(f"{indent}  Distance (m)        : mean {a['dist_mean']:.2f}, "
+          f"p50 {a['dist_p50']:.2f}, p95 {a['dist_p95']:.2f}, max {a['dist_max']:.2f}")
+    print(f"{indent}  Latency (ms)        : mean {a['lat_mean']:.1f}, "
+          f"p50 {a['lat_p50']:.1f}, p95 {a['lat_p95']:.1f}, max {a['lat_max']:.1f}")
+    if a["amb_mean"] is not None:
+        print(f"{indent}  Ambiguity (frame)   : mean {a['amb_mean']:.3f}, "
+              f"p95 {a['amb_p95']:.3f}, max-tag {a['amb_max']:.3f}")
 
 def _fmt_lat(s, suffix=" ms"):
     if s is None:
@@ -595,28 +804,50 @@ def print_camera_block(cam, cdata, enabled_s):
             print(f"    {reason:<18}  {c:>6d}  {100*c/total:>10.1f}%  "
                   f"{100*c/rejected if rejected else 0:>11.1f}%")
 
+    # Accepted-only summary (what the pose estimator actually consumed)
+    _print_accepted_block(_summarize_accepted(cdata.get("accepted", {})),
+                          indent="    ")
+
+def _alliance_str(alliance, source=None):
+    if alliance is None:
+        return "(unknown — no FMS + no zone-tag hits)"
+    src = f" (source: {source})" if source else ""
+    return f"{alliance.upper()}{src}"
+
+def _side_str(tag_alliance, our_alliance):
+    """Return 'ours' / 'theirs' / '-' based on tag ownership vs our alliance."""
+    if our_alliance is None or tag_alliance == "-":
+        return "-"
+    return "ours" if tag_alliance == our_alliance else "theirs"
+
 def print_per_log_report(r):
     print()
     print(SEP)
     print(f"  LOG: {os.path.basename(r['log_path'])}")
     print(SEP)
     print(f"  Enabled time : {r['enabled_s']:.1f} s")
+    print(f"  Our alliance : {_alliance_str(r['alliance'], r.get('alliance_source'))}")
     for cam in CAMERAS:
         print_camera_block(cam, r["cameras"][cam], r["enabled_s"])
 
     # Top tags seen this match
     tags = r["tags"]
+    our = r.get("alliance")
     if tags:
         print(f"\n  Top AprilTags seen this match (across all 3 cameras):")
-        print(f"  {'Tag':>4}  {'Frames':>7}  {'Dist(m)':>14}  {'Ambig':>14}  "
-              f"{'Cameras':<28}")
-        print(f"  {'-'*4}  {'-'*7}  {'-'*14}  {'-'*14}  {'-'*28}")
+        print(f"  {'Tag':>4}  {'Zone':<13}  {'Owns':<5}  {'Side':<6}  "
+              f"{'Frames':>7}  {'Dist(m)':>14}  {'Ambig':>14}  {'Cameras':<20}")
+        print(f"  {'-'*4}  {'-'*13}  {'-'*5}  {'-'*6}  "
+              f"{'-'*7}  {'-'*14}  {'-'*14}  {'-'*20}")
         ordered = sorted(tags.items(), key=lambda kv: -kv[1]["frames"])
         for tid, t in ordered[:15]:
+            zone, ally = zone_for(tid)
+            side = _side_str(ally, our)
             cams_str = ",".join(c.replace("limelight-", "") for c in t["cameras"])
             d = f"{t['dist_mean']:.2f} ({t['dist_min']:.1f}-{t['dist_max']:.1f})"
             a = f"{t['amb_mean']:.3f}/{t['amb_max']:.3f}"
-            print(f"  {tid:>4}  {t['frames']:>7d}  {d:>14}  {a:>14}  {cams_str:<28}")
+            print(f"  {tid:>4}  {zone:<13}  {ally:<5}  {side:<6}  "
+                  f"{t['frames']:>7d}  {d:>14}  {a:>14}  {cams_str:<20}")
 
 # -- Combined analysis -----------------------------------------------------------
 
@@ -627,8 +858,19 @@ def print_combined_analysis(results):
     print(f"  COMBINED LIMELIGHT ANALYSIS ACROSS {n_logs} LOG{'S' if n_logs != 1 else ''}")
     print(SEP)
     total_enabled = sum(r["enabled_s"] for r in results)
+    red_matches   = sum(1 for r in results if r.get("alliance") == "red")
+    blue_matches  = sum(1 for r in results if r.get("alliance") == "blue")
+    unknown       = n_logs - red_matches - blue_matches
+    by_source     = defaultdict(int)
+    for r in results:
+        by_source[r.get("alliance_source", "none")] += 1
     print(f"\n  Total enabled time across logs : {total_enabled:.1f} s  "
           f"({total_enabled/60:.2f} min)")
+    print(f"  Alliance distribution          : "
+          f"RED={red_matches}, BLUE={blue_matches}"
+          + (f", unknown={unknown}" if unknown else ""))
+    src_parts = [f"{k}={v}" for k, v in sorted(by_source.items())]
+    print(f"  Alliance detection sources     : {', '.join(src_parts)}")
 
     # Per-camera season aggregates (weight stats by enabled time per log)
     for cam in CAMERAS:
@@ -715,6 +957,15 @@ def print_combined_analysis(results):
                       f"{100*c/rejected if rejected else 0:>9.1f}%  "
                       f"{c / n_logs:>9.1f}")
 
+        # Accepted-only summary pooled across all logs (season)
+        season_accepted = {"tag_counts": [], "distances": [], "latencies": [],
+                            "amb_means": [], "amb_maxes": []}
+        for r in results:
+            a = r["cameras"][cam].get("accepted", {})
+            for k in season_accepted:
+                season_accepted[k].extend(a.get(k, []))
+        _print_accepted_block(_summarize_accepted(season_accepted), indent="  ")
+
     # Season-wide per-tag table (merge all logs + cameras)
     print()
     print(SEP)
@@ -738,20 +989,58 @@ def print_combined_analysis(results):
     if not tag_agg:
         print("\n  (no AprilTags seen in any log)")
     else:
-        print(f"\n  {'Tag':>4}  {'Frames':>8}  {'Dist mean':>9}  "
-              f"{'Dist range':>12}  {'Amb mean':>8}  {'Amb max':>7}  "
-              f"{'Cams':>5}  {'Per match':>9}")
-        print(f"  {'-'*4}  {'-'*8}  {'-'*9}  {'-'*12}  {'-'*8}  {'-'*7}  "
-              f"{'-'*5}  {'-'*9}")
+        print(f"\n  {'Tag':>4}  {'Zone':<13}  {'Owns':<5}  {'Frames':>8}  "
+              f"{'Dist mean':>9}  {'Dist range':>12}  {'Amb mean':>8}  "
+              f"{'Amb max':>7}  {'Cams':>4}  {'Per match':>9}")
+        print(f"  {'-'*4}  {'-'*13}  {'-'*5}  {'-'*8}  {'-'*9}  {'-'*12}  "
+              f"{'-'*8}  {'-'*7}  {'-'*4}  {'-'*9}")
         ordered = sorted(tag_agg.items(), key=lambda kv: -kv[1]["frames"])
         for tid, a in ordered:
+            zone, ally = zone_for(tid)
             dm = a["dist_sum"] / a["frames"] if a["frames"] else 0.0
             am = a["amb_sum"]  / a["frames"] if a["frames"] else 0.0
             dr = f"{a['dist_min']:.1f}-{a['dist_max']:.1f}"
             per_m = a["frames"] / n_logs
-            print(f"  {tid:>4}  {a['frames']:>8d}  {dm:>7.2f} m  "
-                  f"{dr:>12}  {am:>8.3f}  {a['amb_max']:>7.3f}  "
-                  f"{len(a['cameras']):>5d}  {per_m:>9.1f}")
+            print(f"  {tid:>4}  {zone:<13}  {ally:<5}  {a['frames']:>8d}  "
+                  f"{dm:>7.2f} m  {dr:>12}  {am:>8.3f}  {a['amb_max']:>7.3f}  "
+                  f"{len(a['cameras']):>4d}  {per_m:>9.1f}")
+
+        # Per-zone totals + 'ours' vs 'theirs' breakdown. Uses the alliance
+        # recorded in each match to credit tag sightings correctly even when
+        # the season has matches on both alliances.
+        # Structure: zone_agg[zone] = {"tags": set, "total": int,
+        #                              "ours": int, "theirs": int}
+        zone_agg = defaultdict(lambda: {"tags": set(), "total": 0,
+                                          "ours": 0, "theirs": 0})
+        for r in results:
+            our = r.get("alliance")
+            for tid, t in r["tags"].items():
+                zone, ally = zone_for(tid)
+                za = zone_agg[zone]
+                za["tags"].add(tid)
+                za["total"] += t["frames"]
+                if our is not None and ally != "-":
+                    if ally == our:
+                        za["ours"] += t["frames"]
+                    else:
+                        za["theirs"] += t["frames"]
+        total_frames = sum(z["total"] for z in zone_agg.values())
+        print(f"\n  Zone summary (all cameras, all matches):")
+        print(f"  {'Zone':<13}  {'Tags':>4}  {'Frames':>8}  {'% frames':>9}  "
+              f"{'Per match':>9}  {'Ours':>7}  {'Theirs':>7}")
+        print(f"  {'-'*13}  {'-'*4}  {'-'*8}  {'-'*9}  {'-'*9}  "
+              f"{'-'*7}  {'-'*7}")
+        # Order rows by ZONE_ORDER first, any unexpected zones sorted afterwards
+        seen_zones = list(zone_agg.keys())
+        ordered_zones = ([z for z in ZONE_ORDER if z in zone_agg] +
+                         [z for z in seen_zones if z not in ZONE_ORDER])
+        for zone in ordered_zones:
+            z = zone_agg[zone]
+            pct = 100 * z["total"] / total_frames if total_frames else 0.0
+            per_m = z["total"] / n_logs
+            print(f"  {zone:<13}  {len(z['tags']):>4d}  {z['total']:>8d}  "
+                  f"{pct:>8.1f}%  {per_m:>9.1f}  "
+                  f"{z['ours']:>7d}  {z['theirs']:>7d}")
 
     print()
     print(SEP)
