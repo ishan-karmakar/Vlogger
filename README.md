@@ -194,6 +194,36 @@ python -X utf8 analysis/limelight_analysis.py -j 8 logs/
 
 Outputs (default paths): `analysis/reports/limelight_summary.md`, `analysis/reports/limelight_matches.md`.
 
+### `analysis/gyro_analysis.py`
+
+Pigeon2 gyro + robot accelerometer analysis, plus a separate per-Limelight IMU section. Produces:
+- **Pigeon:** yaw range + net rotation (degrees, unwrapped), pitch / roll time-weighted stats with tilt-event fractions, angular-velocity magnitude stats, per-axis acceleration (x/y/z in m/s²), acceleration magnitude (mean_tw / p50 / p95 / peak in m/s² **and** g), debounced **G-shock event** list with per-event peak + timestamp.
+- **Per Limelight IMU (separate from Pigeon):** roll / pitch / yaw from each camera's onboard IMU, acceleration magnitude in g, per-camera shock-event list. Limelights 4 publish acceleration in **g** directly, so the same `HIGH_G_THRESHOLD_G` is applied without unit conversion.
+- **Season summary:** merges stats across matches with time-weighted means, top-N shock events across the season tagged with match name + alliance (so you can jump to the biggest hits), and the same per-camera split for the LL IMUs.
+- Alliance is pulled from FMS using the same gated detection as `limelight_analysis.py` (only sampled when FMS is attached AND the robot is enabled).
+
+Tunable constants at the top of the script:
+- `HIGH_G_THRESHOLD_G = 3.0` — shock threshold in g
+- `TILT_THRESHOLD_DEG = 10.0` — |pitch| or |roll| above this counts as a tilt event
+- `SHOCK_DEBOUNCE_S = 0.25` — fuse near-simultaneous shock peaks into one event
+
+Required log signals:
+- `NT:/SmartDashboard/SwerveDrive/{Gyro Yaw, Gyro Pitch, Gyro Roll, Angular Velocity, Acceleration}`
+- `NT:/limelight-{center,left,right}/imu` (10-element array: `[robotYaw, roll, pitch, yaw, gyroX, gyroY, gyroZ, accelX, accelY, accelZ]` per LL4 docs)
+- `NT:/FMSInfo/{IsRedAlliance, FMSControlData}`
+- `DS:enabled`, `DS:autonomous`
+
+```bash
+python -X utf8 analysis/gyro_analysis.py logs/
+python -X utf8 analysis/gyro_analysis.py -j 8 logs/
+```
+
+Outputs (default paths): `analysis/reports/gyro_summary.md`, `analysis/reports/gyro_matches.md`.
+
+Notes on the data this season:
+- The Pigeon roll signal appears bimodal near ±180° — suggests the robot-side Pigeon mount offsets need review (expected roll at rest is near zero).
+- LL IMUs saturate around **13.85 g** — any shock event hitting that value is a lower bound, real peak was higher.
+
 ### Notes on running the analysis scripts
 
 - On Windows, use `python -X utf8 ...` to avoid CP1252 encoding errors on some terminals.

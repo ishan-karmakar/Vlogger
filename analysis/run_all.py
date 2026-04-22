@@ -76,6 +76,11 @@ ANALYSES = [
         "script":      "limelight_analysis.py",
         "description": "Vision: 3 cameras — latency, targets visible, distance, per-tag summary.",
     },
+    {
+        "name":        "gyro",
+        "script":      "gyro_analysis.py",
+        "description": "Pigeon + LL IMUs — orientation, angular velocity, G-shock events.",
+    },
 ]
 
 def banner(msg, ch="="):
