@@ -71,6 +71,11 @@ ANALYSES = [
         "script":      "joystick_analysis.py",
         "description": "Driver + operator gamepad input: axis activity, button presses, POV usage.",
     },
+    {
+        "name":        "limelight",
+        "script":      "limelight_analysis.py",
+        "description": "Vision: 3 cameras — latency, targets visible, distance, per-tag summary.",
+    },
 ]
 
 def banner(msg, ch="="):
