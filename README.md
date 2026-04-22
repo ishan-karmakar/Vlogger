@@ -162,6 +162,38 @@ python -X utf8 analysis/joystick_analysis.py --serial logs/GF1/FRC_xxx.wpilog
 
 Outputs (default paths): `analysis/reports/joystick_summary.md`, `analysis/reports/joystick_matches.md`.
 
+### `analysis/limelight_analysis.py`
+
+All three Limelights (`limelight-center` / `-left` / `-right`) analyzed against the robot's actual vision filter. Produces:
+- **Per-camera, per-match:**
+  - Active-as-pose-source %, raw `tv` %, team `hasTarget` %, `Vision Filter Pass` %
+  - Capture / target / end-to-end latency (mean / p50 / p95 / max)
+  - Frames with any tag + average tags per frame
+  - Distance to primary target (mean / p95 / max)
+  - Doubts Rotational / Translational with inf-rejection rate
+  - **Rejection breakdown** — every vision frame is re-classified against the C++ filter gates from `AprilTagsSensor::applyVisionMeasurement()` + `Drivetrain.cpp`: `NOT_ACTIVE` / `NO_TARGET` / `MALFORMED` / `NO_TAGS` / `STALE` / `OUT_OF_FIELD` / `HIGH_AMBIGUITY` / `TOO_FAR`. Both raw counts and % of rejects shown.
+- **Per-tag summary** (per match + season): tag ID, frame count, mean / min / max distance, mean / max ambiguity, which cameras saw it, avg-per-match count.
+- **Season combined:** time-weighted metrics pooled across matches, full rejection breakdown.
+
+Threshold constants come directly from the robot code (see top of the script):
+- `AMBIGUITY_THRESHOLD = 0.2` (matches `Drivetrain.cpp:118` override)
+- `MAX_LATENCY_MS = 2000` (AprilTagsSensor default `maxMeasurementAge`)
+- `FIELD_BORDER_M = 0.5` (AprilTagsSensor default `fieldBorderMargin`)
+- `MAX_VISION_DIST_M = 5.0` (Drivetrain.cpp `MAX_VISION_MEASUREMENT`)
+- `FIELD_LENGTH_M / FIELD_WIDTH_M = 17.548 / 8.052` (WPILib `k2026RebuiltAndyMark`)
+
+Required log signals per camera:
+- `NT:/<cam>/{cl, tl, tv, tid, ta, rawfiducials, botpose_wpiblue}`
+- `NT:/SmartDashboard/SwerveDrive/<cam>/{Active Camera, hasTarget, totalLatency, Vision Filter Pass, Doubts/Rotational, Doubts/Translational, Field Calibration/Distance to Tag}`
+- `DS:enabled`, `DS:autonomous`
+
+```bash
+python -X utf8 analysis/limelight_analysis.py logs/
+python -X utf8 analysis/limelight_analysis.py -j 8 logs/
+```
+
+Outputs (default paths): `analysis/reports/limelight_summary.md`, `analysis/reports/limelight_matches.md`.
+
 ### Notes on running the analysis scripts
 
 - On Windows, use `python -X utf8 ...` to avoid CP1252 encoding errors on some terminals.
