@@ -99,6 +99,16 @@ FEEDER_MOTORS = {
     "Left Feeder":  "NT:/SmartDashboard/Intake/Left Feeder Motor",
     "Right Feeder": "NT:/SmartDashboard/Intake/Right Feeder Motor",
 }
+# Pivot is position-controlled (not speed-controlled like the others), so it
+# gets analyzed in its own block with closed-loop error + position metrics.
+PIVOT_MOTOR_BASE = "NT:/SmartDashboard/Intake/Pivot Motor"
+PIVOT_STATE_PATH = "NT:/SmartDashboard/Intake/Pivot State"
+# Pivot state values published by the robot (Intake.cpp PIVOT_STATE enum):
+PIVOT_STATES = ["OFF", "RETRACTED", "DEPLOYED", "SHIMMY_IN", "SHIMMY_OUT"]
+
+# |error| <= this (in native position units, typically rotations) counts as
+# "at setpoint". Tune after observing actual error distributions.
+PIVOT_AT_SETPOINT_TOLERANCE = 0.05
 
 # Per motor we need: Speed, Stator Current, Supply Current, Out Volt, reqSpeed.
 # Feeders don't publish Supply Current (handled gracefully by load_series).
@@ -108,9 +118,10 @@ STATE_PATH = "NT:/SmartDashboard/Intake/Intake State"
 JAM_PATH   = "NT:/SmartDashboard/Intake/Intake Jam"
 
 INTAKE_REGEX = (
-    r"(NT:/SmartDashboard/Intake/(Intake State|Intake Jam|"
+    r"(NT:/SmartDashboard/Intake/(Intake State|Intake Jam|Pivot State|"
     r"(Left|Right) (Intake|Feeder|Hopper) Motor/"
-    r"(Speed|Stator Current|Supply Current|Out Volt|reqSpeed))"
+    r"(Speed|Stator Current|Supply Current|Out Volt|reqSpeed)|"
+    r"Pivot Motor/(Speed|Stator Current|Supply Current|Out Volt|Position|reqPosition))"
     r"|DS:(enabled|autonomous))"
 )
 
@@ -135,7 +146,24 @@ ROBOT_JAM_SPEED_TPS      = 1.0
 # Only labels we actually want to overlay from hoot (the analyzer's motors).
 HOOT_LABELS_TO_OVERLAY = (
     SUBSYSTEMS["intake"] + SUBSYSTEMS["hopper"] + SUBSYSTEMS["feeder"]
+    + SUBSYSTEMS["intake_pivot"]
 )
+
+# CAN device label (from can_config.CAN_DEVICES) -> the NT path base used in
+# the wpilog for that motor. Used by the hoot overlay to route hoot samples
+# back to the same NT-style keys the rest of the analyzer expects. Most
+# labels match directly (e.g. "Left Intake" -> "Left Intake Motor"), but a
+# few need explicit translation — the pivot's NT path is just "Pivot Motor",
+# not "Intake Pivot Motor".
+HOOT_LABEL_TO_NT_BASE = {
+    "Left Intake":  "NT:/SmartDashboard/Intake/Left Intake Motor",
+    "Right Intake": "NT:/SmartDashboard/Intake/Right Intake Motor",
+    "Left Hopper":  "NT:/SmartDashboard/Intake/Left Hopper Motor",
+    "Right Hopper": "NT:/SmartDashboard/Intake/Right Hopper Motor",
+    "Left Feeder":  "NT:/SmartDashboard/Intake/Left Feeder Motor",
+    "Right Feeder": "NT:/SmartDashboard/Intake/Right Feeder Motor",
+    "Intake Pivot": PIVOT_MOTOR_BASE,
+}
 # Hoot signal -> NT-style signal name. Hoot RotorVelocity is rotations/sec at
 # the motor (matches the "TPS" semantics of NT Speed for our purposes — the
 # jam detector uses ratios, not absolute speeds).
@@ -381,7 +409,18 @@ def _overlay_hoot_into(raw, hoot_path):
         nt_signal   = HOOT_SIGNAL_MAP.get(signal)
         if motor_label is None or nt_signal is None:
             continue
-        nt_key = f"NT:/SmartDashboard/Intake/{motor_label} Motor/{nt_signal}"
+        # Route hoot samples back to the NT path the robot uses. The pivot's
+        # NT base is "Pivot Motor" not "Intake Pivot Motor", hence the explicit
+        # translation table.
+        nt_base = HOOT_LABEL_TO_NT_BASE.get(motor_label)
+        if nt_base is None:
+            continue
+        # Hoot RotorVelocity is motor-shaft TPS but the pivot NT key for
+        # velocity is named "Speed". For the pivot we also want the *position*
+        # overlaid, but hoot's RotorPosition is not in our signal list yet
+        # (it'd need to be added to HOOT_SIGNAL_MAP). Leaving pivot position
+        # from NT for now — it updates frequently enough to be usable.
+        nt_key = f"{nt_base}/{nt_signal}"
         raw[nt_key] = pts
         total_samples += len(pts)
         replaced_keys += 1
@@ -544,6 +583,153 @@ def energy_over_intervals(voltage_pts, current_pts, intervals, t_end):
             continue
         total += 0.5 * (p_grid[i] + p_grid[i + 1]) * ov
     return float(total)
+
+# -- Pivot analysis -------------------------------------------------------------
+
+def _interp_signal(ts_arr, vals, target_ts):
+    """Step-hold interpolation: for each ts in target_ts, return the last
+    value at or before that ts (or None if before the first sample)."""
+    if len(ts_arr) == 0:
+        return [None] * len(target_ts)
+    idx = np.searchsorted(ts_arr, target_ts, side="right") - 1
+    out = []
+    for i in idx:
+        out.append(vals[i] if i >= 0 else None)
+    return out
+
+def analyze_pivot(series, enabled_intervals, t_end):
+    """
+    Pivot motor analysis: per Pivot State, report stator/supply current
+    stats, position + reqPosition stats, and closed-loop error stats.
+    Includes a "time at setpoint" metric (|error| <= PIVOT_AT_SETPOINT_TOLERANCE).
+
+    Returns None if the pivot isn't logged in this match.
+    """
+    pos_pts  = series.get(f"{PIVOT_MOTOR_BASE}/Position", [])
+    req_pts  = series.get(f"{PIVOT_MOTOR_BASE}/reqPosition", [])
+    cst_pts  = series.get(f"{PIVOT_MOTOR_BASE}/Stator Current", [])
+    sup_pts  = series.get(f"{PIVOT_MOTOR_BASE}/Supply Current", [])
+    vlt_pts  = series.get(f"{PIVOT_MOTOR_BASE}/Out Volt", [])
+    spd_pts  = series.get(f"{PIVOT_MOTOR_BASE}/Speed", [])
+    state_pts = series.get(PIVOT_STATE_PATH, [])
+
+    if not pos_pts and not cst_pts:
+        return None
+
+    # Per-state intervals (intersected with enabled, same approach as the
+    # Intake State breakdown)
+    raw_pivot_state_intervals = compute_state_intervals(state_pts, PIVOT_STATES, t_end)
+    pivot_state_intervals = {
+        s: intersect_intervals(raw_pivot_state_intervals[s], enabled_intervals)
+        for s in PIVOT_STATES
+    }
+    pivot_state_secs = {s: intervals_total(pivot_state_intervals[s]) for s in PIVOT_STATES}
+
+    # Closed-loop error: computed at each Position sample as
+    #   error(t) = Position(t) - reqPosition_lookup(t)
+    # reqPosition is held until next update, so step-hold interpolation is
+    # the right semantic.
+    error_pts = []
+    if pos_pts and req_pts:
+        pos_ts   = np.array([ts for ts, _ in pos_pts])
+        pos_vals = np.array([float(v) for _, v in pos_pts])
+        req_ts   = np.array([ts for ts, _ in req_pts])
+        req_vals = [float(v) for _, v in req_pts]
+        req_lookup = _interp_signal(req_ts, req_vals, pos_ts)
+        for ts, pos, req in zip(pos_ts.tolist(), pos_vals.tolist(), req_lookup):
+            if req is None:
+                continue
+            error_pts.append((ts, pos - req))
+
+    # Time at setpoint per state (and overall enabled)
+    def _time_at_setpoint(intervals):
+        if not error_pts or not intervals:
+            return 0.0
+        t_in = 0.0
+        prev_ts  = None
+        prev_err = None
+        for ts, err in error_pts:
+            if prev_ts is not None and prev_err is not None:
+                if abs(prev_err) <= PIVOT_AT_SETPOINT_TOLERANCE:
+                    t_in += overlap_with_intervals(prev_ts, ts, intervals)
+            prev_ts = ts
+            prev_err = err
+        # Trailing segment
+        if prev_ts is not None and prev_err is not None:
+            if abs(prev_err) <= PIVOT_AT_SETPOINT_TOLERANCE:
+                t_last = max(t for t, _ in error_pts)
+                t_in += overlap_with_intervals(prev_ts, t_last, intervals)
+        return float(t_in)
+
+    # Per-state metrics: stator, supply, |speed|, position, reqPosition,
+    # |error|, and at-setpoint time
+    per_state = {}
+    for s in PIVOT_STATES + ["ENABLED"]:   # "ENABLED" = overall enabled time
+        ivs = pivot_state_intervals[s] if s in pivot_state_intervals else enabled_intervals
+        per_state[s] = {
+            "seconds":    intervals_total(ivs),
+            "stator":     time_weighted_abs_stats(cst_pts, ivs, t_end),
+            "supply":     time_weighted_abs_stats(sup_pts, ivs, t_end),
+            "speed":      time_weighted_abs_stats(spd_pts, ivs, t_end),
+            # Position is signed, so report raw samples (not abs) for range
+            "position":   _signed_stats(pos_pts, ivs, t_end),
+            "reqPosition":_signed_stats(req_pts, ivs, t_end),
+            "abs_error":  time_weighted_abs_stats(error_pts, ivs, t_end),
+            "at_setpoint_s": _time_at_setpoint(ivs),
+        }
+
+    # Energy consumed by pivot over enabled time
+    energy = energy_over_intervals(vlt_pts, cst_pts, enabled_intervals, t_end)
+
+    return {
+        "state_secs":    pivot_state_secs,
+        "per_state":     per_state,
+        "energy_J":      energy,
+        "n_position":    len(pos_pts),
+        "n_req":         len(req_pts),
+        "n_error":       len(error_pts),
+    }
+
+def _signed_stats(pts, intervals, t_end):
+    """Time-weighted mean + min/p5/p95/max on signed values (for position,
+    where the sign matters — pivot retracted vs deployed)."""
+    if not pts or not intervals:
+        return None
+    samples = []
+    integral = 0.0
+    total_time = 0.0
+    prev_ts = None
+    prev_v  = None
+    for ts, v in pts:
+        if not isinstance(v, (int, float)):
+            continue
+        fv = float(v)
+        if ts_in_intervals(ts, intervals):
+            samples.append(fv)
+        if prev_ts is not None and prev_v is not None:
+            ov = overlap_with_intervals(prev_ts, ts, intervals)
+            if ov > 0:
+                integral   += prev_v * ov
+                total_time += ov
+        prev_ts = ts
+        prev_v  = fv
+    if prev_ts is not None and prev_v is not None:
+        ov = overlap_with_intervals(prev_ts, t_end, intervals)
+        if ov > 0:
+            integral   += prev_v * ov
+            total_time += ov
+    if not samples or total_time <= 0:
+        return None
+    arr = np.array(samples)
+    return {
+        "n":       len(samples),
+        "mean_tw": float(integral / total_time),
+        "min":     float(np.min(arr)),
+        "p5":      float(np.percentile(arr, 5)),
+        "p50":     float(np.percentile(arr, 50)),
+        "p95":     float(np.percentile(arr, 95)),
+        "max":     float(np.max(arr)),
+    }
 
 # -- Jam detection -------------------------------------------------------------
 
@@ -781,6 +967,9 @@ def analyze_log(log_path):
     # Custom jam events
     custom_jams = detect_custom_jams(series, state_pts, enabled_intervals, t_end)
 
+    # Pivot (position-controlled motor, analyzed separately)
+    pivot = analyze_pivot(series, enabled_intervals, t_end)
+
     result = {
         "log_path":         log_path,
         "session_len":      t_end,
@@ -792,6 +981,7 @@ def analyze_log(log_path):
         "robot_jam_edges":  robot_jam_edges,
         "robot_jam_time":   float(robot_jam_time),
         "custom_jams":      custom_jams,
+        "pivot":            pivot,
     }
     del series
     return result
@@ -843,6 +1033,50 @@ def print_per_log_report(r):
             su = _fmt_abs(row["supply"])
             sp = _fmt_abs(row["speed"])
             print(f"    {s:<10}  {st:<38}  {su:<38}  {sp:<38}")
+
+    # Pivot (position-controlled — separate block)
+    p = r.get("pivot")
+    if p is not None:
+        print()
+        print(f"  [Intake Pivot]  energy {p['energy_J']:.0f} J  "
+              f"(Position n={p['n_position']}, error samples n={p['n_error']})")
+        if p["state_secs"]:
+            parts = [f"{s}={p['state_secs'][s]:.1f}s"
+                     for s in PIVOT_STATES if p['state_secs'][s] > 0]
+            print(f"    Pivot-state time : " + ", ".join(parts) if parts else
+                  "    Pivot-state time : (no state samples)")
+        # Table header
+        print(f"    {'State':<11}  {'Secs':>5}  {'Stator (A)':<24}  "
+              f"{'Supply (A)':<24}  {'|Error| (rot)':<24}  {'At setpt':>8}")
+        print(f"    {'-'*11}  {'-'*5}  {'-'*24}  {'-'*24}  {'-'*24}  {'-'*8}")
+        for s in PIVOT_STATES + ["ENABLED"]:
+            row = p["per_state"][s]
+            secs = row["seconds"]
+            if secs <= 0:
+                continue
+            def _fmt_short_stat(stat, unit=""):
+                if stat is None:
+                    return "-"
+                return (f"{stat['mean_tw']:.1f}/{stat['p95']:.1f}/"
+                        f"{stat['max']:.1f}{unit}")
+            at_pct = (100 * row["at_setpoint_s"] / secs) if secs > 0 else 0.0
+            print(f"    {s:<11}  {secs:>4.1f}s  "
+                  f"{_fmt_short_stat(row['stator'], ' A'):<24}  "
+                  f"{_fmt_short_stat(row['supply'], ' A'):<24}  "
+                  f"{_fmt_short_stat(row['abs_error']):<24}  "
+                  f"{at_pct:>6.1f}%")
+
+        # Position range, signed, for enabled time
+        pos = p["per_state"]["ENABLED"]["position"]
+        req = p["per_state"]["ENABLED"]["reqPosition"]
+        if pos is not None:
+            print(f"    Position (enabled) : mean {pos['mean_tw']:+.3f}, "
+                  f"range [{pos['min']:+.3f}, {pos['max']:+.3f}] rot")
+        if req is not None:
+            print(f"    reqPosition        : mean {req['mean_tw']:+.3f}, "
+                  f"range [{req['min']:+.3f}, {req['max']:+.3f}] rot")
+        print(f"    At-setpoint threshold: |error| <= "
+              f"{PIVOT_AT_SETPOINT_TOLERANCE} (native units, typically rotations)")
 
     # Jam comparison
     print()
@@ -930,6 +1164,55 @@ def print_combined_analysis(results):
                 return (f"mean {s['mean_tw']:.1f}, p95 {s['p95']:.1f}, max {s['max']:.1f}"
                         if s else "-")
             print(f"    {s:<10}  {_short(st):<30}  {_short(su):<30}  {_short(sp):<30}")
+
+    # Pivot season summary
+    pivot_results = [r["pivot"] for r in results if r.get("pivot")]
+    if pivot_results:
+        print()
+        print(SEP)
+        print("  INTAKE PIVOT — season summary")
+        print(SEP)
+
+        total_energy = sum(p["energy_J"] for p in pivot_results)
+        print(f"\n  Total pivot energy (enabled) : {total_energy/1000:.2f} kJ  "
+              f"(avg {total_energy/n_logs/1000:.2f} kJ/match)")
+
+        # Per-pivot-state aggregate
+        state_secs_total = defaultdict(float)
+        for p in pivot_results:
+            for s, secs in p["state_secs"].items():
+                state_secs_total[s] += secs
+        nonzero = {s: v for s, v in state_secs_total.items() if v > 0}
+        if nonzero:
+            print(f"  Total pivot-state time       : "
+                  + ", ".join(f"{s}={nonzero[s]:.1f}s" for s in PIVOT_STATES
+                               if nonzero.get(s)))
+
+        print()
+        print(f"  {'State':<11}  {'Secs':>7}  {'Stator (A) mean/p95/max':<28}  "
+              f"{'Supply (A) mean/p95/max':<28}  {'|Error| mean/p95/max':<28}  {'At setpt':>8}")
+        print(f"  {'-'*11}  {'-'*7}  {'-'*28}  {'-'*28}  {'-'*28}  {'-'*8}")
+        for s in PIVOT_STATES + ["ENABLED"]:
+            stator_list = [p["per_state"][s]["stator"] for p in pivot_results]
+            supply_list = [p["per_state"][s]["supply"] for p in pivot_results]
+            error_list  = [p["per_state"][s]["abs_error"] for p in pivot_results]
+            total_secs  = sum(p["per_state"][s]["seconds"] for p in pivot_results)
+            total_at    = sum(p["per_state"][s]["at_setpoint_s"] for p in pivot_results)
+            if total_secs <= 0:
+                continue
+            merged_st = _merge_abs_stats(stator_list)
+            merged_su = _merge_abs_stats(supply_list)
+            merged_er = _merge_abs_stats(error_list)
+            def _short(stat, unit=""):
+                if stat is None:
+                    return "-"
+                return f"{stat['mean_tw']:.2f}/{stat['p95']:.2f}/{stat['max']:.2f}{unit}"
+            at_pct = 100 * total_at / total_secs if total_secs > 0 else 0.0
+            print(f"  {s:<11}  {total_secs:>6.1f}s  "
+                  f"{_short(merged_st, ' A'):<28}  "
+                  f"{_short(merged_su, ' A'):<28}  "
+                  f"{_short(merged_er):<28}  "
+                  f"{at_pct:>6.1f}%")
 
     # Jam detection summary
     print()
