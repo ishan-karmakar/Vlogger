@@ -81,6 +81,11 @@ ANALYSES = [
         "script":      "gyro_analysis.py",
         "description": "Pigeon + LL IMUs — orientation, angular velocity, G-shock events.",
     },
+    {
+        "name":        "drivetrain",
+        "script":      "drivetrain_analysis.py",
+        "description": "Swerve drive + azimuth current/speed/energy, AUTO vs TELEOP.",
+    },
 ]
 
 def banner(msg, ch="="):

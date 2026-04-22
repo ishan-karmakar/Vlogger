@@ -224,6 +224,52 @@ Notes on the data this season:
 - The Pigeon roll signal appears bimodal near ±180° — suggests the robot-side Pigeon mount offsets need review (expected roll at rest is near zero).
 - LL IMUs saturate around **13.85 g** — any shock event hitting that value is a lower bound, real peak was higher.
 
+### `analysis/drivetrain_analysis.py`
+
+Swerve drivetrain current / speed / energy across all 8 motors (4 drive + 4 azimuth), separated into **AUTO** vs **TELEOP** phases so you can compare how hard the drivetrain works in each mode. Produces:
+- **Per module, per role, per phase:** time-weighted mean / p50 / p95 / max of stator current, supply current, and |speed|, plus motor electrical energy (|V|·|I| integrated). Phases: AUTO (enabled + autonomous), TELEOP (enabled + not autonomous), COMBINED (all enabled time).
+- **Role totals per phase:** rolled-up Drive-vs-Azimuth stats across all 4 modules.
+- **Drivetrain grand totals:** total energy + avg power for AUTO / TELEOP / COMBINED.
+- **AUTO vs TELEOP intensity ratio:** side-by-side comparison of mean/p95/peak stator current, mean speed, and avg power with an Auto-to-Teleop ratio column.
+
+Uses the shared `analysis/can_config.py` CAN-ID mapping. NT publishes Stator Current + Speed + Out Volt for each motor but not Supply Current; the hoot overlay (same pattern as `intake_analysis.py`) fills that in from the Canivore `.hoot` file when present.
+
+Module → CAN ID mapping (stable across robot variants):
+- Module 0: Drive=CAN 2, Azimuth=CAN 1
+- Module 1: Drive=CAN 4, Azimuth=CAN 3
+- Module 2: Drive=CAN 6, Azimuth=CAN 5
+- Module 3: Drive=CAN 8, Azimuth=CAN 7
+
+Module → **corner** mapping (FL/FR/BL/BR) **varies by robot variant** (see `Constants::getModuleCoordsX/Y()` in the robot repo — DryBones/ShyGuy/Gold/Koopa/Drizzle/Downpour each have different orderings). The analyzer labels modules 0–3 and leaves corner correlation to you.
+
+Required log signals:
+- `NT:/SmartDashboard/SwerveDrive/Module {0..3}/Drive Motor/{Stator Current, Speed, Out Volt, reqSpeed}`
+- `NT:/SmartDashboard/SwerveDrive/Module {0..3}/Azimuth Motor/{Stator Current, Speed, Out Volt, reqPosition}`
+- `DS:enabled`, `DS:autonomous`
+
+Optional (for Supply Current + higher-fidelity data):
+- Canivore `.hoot` file next to the wpilog (`owlet.exe` on PATH or at repo root)
+
+```bash
+python -X utf8 analysis/drivetrain_analysis.py logs/E1
+python -X utf8 analysis/drivetrain_analysis.py logs/
+```
+
+Outputs (default paths): `analysis/reports/drivetrain_summary.md`, `analysis/reports/drivetrain_matches.md`.
+
+### `analysis/cache_log_keys.py` (log-field reference)
+
+Utility that scans a WPILog + any sibling `.hoot` files and writes a single markdown catalog of every logged signal to [`analysis/LOG_REFERENCE.md`](analysis/LOG_REFERENCE.md). Future scripts and LLM agents can grep that file instead of re-probing a log every time they need to know what signals are available.
+
+Run once per major robot-code change:
+```bash
+python -X utf8 analysis/cache_log_keys.py              # auto-pick a wpilog from logs/
+python -X utf8 analysis/cache_log_keys.py logs/E1      # scan a folder's wpilog + sibling hoots
+python -X utf8 analysis/cache_log_keys.py --wpilog path/to/match.wpilog --no-hoot
+```
+
+The generated `LOG_REFERENCE.md` groups fields by subsystem (DS/FMS, Joysticks, Limelight, Shooter, Intake, SwerveDrive modules, etc.), hides noise fields (`.controllable`, `Tuning Mode`, etc.), and includes both WPILog field types AND hoot signal hex IDs (useful for `owlet -s` filtered decodes).
+
 ### Notes on running the analysis scripts
 
 - On Windows, use `python -X utf8 ...` to avoid CP1252 encoding errors on some terminals.
