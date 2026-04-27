@@ -12,10 +12,31 @@ Vlogger ships three things in one repo:
 
 ### Prerequisites
 
-- **Python ≥ 3.10**
-- **Poetry** (`pipx install poetry` or `curl -sSL https://install.python-poetry.org | python3 -`)
+- **Python ≥ 3.10** (download from <https://www.python.org/downloads/> — on Windows, check **"Add python.exe to PATH"** during install).
+- A way to manage dependencies. Pick one:
+  - **pip + venv** — built into Python; the path most FRC students already know.
+  - **Poetry** — used for development on this project; install via `pipx install poetry` or the [official installer](https://python-poetry.org/docs/#installation).
 
-### Install
+### Easiest path — Windows (pits laptop)
+
+Double-click **`run-gui.bat`** at the repo root. The script creates a virtual environment in `.venv/`, installs the dependencies from `requirements.txt`, and launches the Streamlit GUI in your browser. Subsequent runs skip straight to launch.
+
+### Setup with pip + venv (cross-platform)
+
+```bash
+git clone git@git.valor6800.com:valor6800/vlogger.git
+cd vlogger
+
+# Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate          # macOS/Linux
+.venv\Scripts\activate             # Windows (cmd)
+.venv\Scripts\Activate.ps1         # Windows (PowerShell)
+
+pip install -r requirements.txt
+```
+
+### Setup with Poetry (recommended for development)
 
 ```bash
 git clone git@git.valor6800.com:valor6800/vlogger.git
@@ -23,22 +44,26 @@ cd vlogger
 poetry install
 ```
 
-### Quick start — pits workflow (GUI)
+### Quick start — GUI
+
+After setup, launch the Streamlit app:
 
 ```bash
-poetry run streamlit run gui/app.py
+streamlit run gui/app.py            # pip + venv (with venv activated)
+poetry run streamlit run gui/app.py # Poetry
 ```
 
-Streamlit prints a local URL (defaults to <http://localhost:8501>). Open it, point the sidebar at a directory of `.wpilog` files (e.g. `logs/<event>/`), pick the matches you want, and the tabs render per-match and season-wide analysis. See [Streamlit GUI](#streamlit-gui) for details.
+Streamlit prints a local URL (defaults to <http://localhost:8501>). Open it, point the sidebar at a directory of `.wpilog` files (e.g. `logs/<event>/`), pick the matches you want, and each tab renders per-match and season-wide analysis. See [Streamlit GUI](#streamlit-gui) for details.
 
 ### Quick start — CLI
 
 ```bash
 # Run every analysis in analysis/ against a directory of logs
-poetry run python -X utf8 analysis/run_all.py logs/
+python -X utf8 analysis/run_all.py logs/             # pip + venv
+poetry run python -X utf8 analysis/run_all.py logs/  # Poetry
 
 # Or invoke any one script directly
-poetry run python -X utf8 analysis/flywheel_analysis.py logs/
+python -X utf8 analysis/flywheel_analysis.py logs/
 ```
 
 Reports land in `analysis/reports/` (gitignored). See [Analysis Scripts](#analysis-scripts) for the full flag set.
@@ -54,6 +79,16 @@ with vlogger.get_source("my_log.wpilog", [""]) as source:
 ```
 
 See [Examples](#examples) for more.
+
+### Updating dependencies
+
+When `requirements.txt` or `pyproject.toml` changes (`git pull` brings in new deps):
+
+- **`run-gui.bat`** — re-running it picks up new packages automatically (`pip install` is idempotent).
+- **pip + venv** — `pip install -r requirements.txt` again.
+- **Poetry** — `poetry install`.
+
+`requirements.txt` is generated from `pyproject.toml` via `poetry export --without-hashes -f requirements.txt -o requirements.txt`. Regenerate after every `poetry add` / `poetry remove` so the pip path stays in sync.
 
 ## Supported Sources
 - [x] [WPILog](https://github.com/wpilibsuite/allwpilib/blob/main/wpiutil/doc/datalog.adoc) (supports structs and protobufs)
@@ -262,9 +297,13 @@ A local-first Streamlit app at `gui/app.py` provides a browser UI over the same 
 
 ### Launching
 
+The fastest path on Windows is to **double-click `run-gui.bat`** at the repo root — it sets up `.venv/`, installs deps, and launches the GUI in one step. See [Getting Started](#getting-started) for the manual cross-platform setup.
+
+Once installed, launch the app with whichever stack you used to install:
+
 ```bash
-poetry install                          # first time, installs streamlit/pandas/plotly
-poetry run streamlit run gui/app.py
+streamlit run gui/app.py            # pip + venv (with venv activated)
+poetry run streamlit run gui/app.py # Poetry
 ```
 
 Then open the URL Streamlit prints (defaults to <http://localhost:8501>).
