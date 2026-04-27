@@ -3,6 +3,58 @@
 Vlogger is a generic library that provides an abstraction over the various kinds of files and live sources that are used in FRC.  
 This package is developed and used by FRC Valor 6800 for post match analysis.
 
+## Getting Started
+
+Vlogger ships three things in one repo:
+1. The **`vlogger` library** for parsing FRC log sources (see [API Structure](#api-structure)).
+2. **CLI analysis scripts** in `analysis/` that produce per-match and season reports (see [Analysis Scripts](#analysis-scripts)).
+3. A local **Streamlit GUI** in `gui/` that wraps the analysis scripts in a browser UI (see [Streamlit GUI](#streamlit-gui)).
+
+### Prerequisites
+
+- **Python ≥ 3.10**
+- **Poetry** (`pipx install poetry` or `curl -sSL https://install.python-poetry.org | python3 -`)
+
+### Install
+
+```bash
+git clone git@git.valor6800.com:valor6800/vlogger.git
+cd vlogger
+poetry install
+```
+
+### Quick start — pits workflow (GUI)
+
+```bash
+poetry run streamlit run gui/app.py
+```
+
+Streamlit prints a local URL (defaults to <http://localhost:8501>). Open it, point the sidebar at a directory of `.wpilog` files (e.g. `logs/<event>/`), pick the matches you want, and the tabs render per-match and season-wide analysis. See [Streamlit GUI](#streamlit-gui) for details.
+
+### Quick start — CLI
+
+```bash
+# Run every analysis in analysis/ against a directory of logs
+poetry run python -X utf8 analysis/run_all.py logs/
+
+# Or invoke any one script directly
+poetry run python -X utf8 analysis/flywheel_analysis.py logs/
+```
+
+Reports land in `analysis/reports/` (gitignored). See [Analysis Scripts](#analysis-scripts) for the full flag set.
+
+### Quick start — library
+
+```python
+import vlogger
+
+with vlogger.get_source("my_log.wpilog", [""]) as source:
+    for field in source:
+        print(field)
+```
+
+See [Examples](#examples) for more.
+
 ## Supported Sources
 - [x] [WPILog](https://github.com/wpilibsuite/allwpilib/blob/main/wpiutil/doc/datalog.adoc) (supports structs and protobufs)
 - [x] [NetworkTables4](https://github.com/wpilibsuite/allwpilib/blob/main/ntcore/doc/networktables4.adoc) (supports structs and protobufs)
@@ -132,6 +184,7 @@ Outputs (default paths): `analysis/reports/flywheel_summary.md`, `analysis/repor
 
 Intake motor analysis covering two motors (Left/Right) plus jam events. Produces:
 - Per-match: duration, peak speeds, total intake energy, time distribution across `OFF` / `INTAKING` / `SHOOTING` states, per-cycle table for every INTAKING window (duration, commanded vs actual speed, stator + supply current, energy, jam count), stall detection, jam event list with cycle/state context, SHOOTING state summary.
+- Season summary: per-match summary table, totals + per-match averages, INTAKING cycle stats across all matches (reached/stalled/jammed rates, duration, energy, current), SHOOTING window aggregates, time distribution.
 
 Required log signals (under `SmartDashboard/Intake/`):
 - `Left Intake Motor/*` and `Right Intake Motor/*` (`Speed`, `Stator Current`, `Supply Current`, `Out Volt`, `reqSpeed`)
@@ -140,10 +193,12 @@ Required log signals (under `SmartDashboard/Intake/`):
 
 ```bash
 python -X utf8 analysis/intake_analysis.py
-python -X utf8 analysis/intake_analysis.py logs/GF1/FRC_xxx.wpilog
+python -X utf8 analysis/intake_analysis.py logs/
+python -X utf8 analysis/intake_analysis.py -j 8 logs/
+python -X utf8 analysis/intake_analysis.py --no-file logs/GF1/FRC_xxx.wpilog
 ```
 
-Currently prints to terminal only (no markdown file output yet).
+Outputs (default paths): `analysis/reports/intake_summary.md`, `analysis/reports/intake_matches.md`.
 
 ### `analysis/joystick_analysis.py`
 
@@ -197,8 +252,62 @@ Each analysis is a **standalone Python file in `analysis/`** that follows a smal
    ```
 6. Reports go into `analysis/reports/` by default, which is gitignored — no changes to `.gitignore` needed.
 7. Add a short section to this README under "Analysis Scripts" describing what the script produces and the log signals it depends on.
+8. Add a tab module under `gui/tabs/` so the new analysis is reachable from the Streamlit GUI (see "Streamlit GUI" below).
 
 Why subprocesses for the orchestrator instead of importing each script's `main()`? Each script owns its own `ProcessPoolExecutor` and stderr/stdout formatting. Subprocesses keep them fully decoupled so one script's failure can't corrupt another's state, and adding a new script requires zero changes to the wrapper beyond the registry entry.
+
+## Streamlit GUI
+
+A local-first Streamlit app at `gui/app.py` provides a browser UI over the same per-match and season analyses produced by the CLI scripts. It is intended to run on a single machine in the pits: point it at a directory of `.wpilog` files (downloaded after each match) and drill into the results without leaving the browser.
+
+### Launching
+
+```bash
+poetry install                          # first time, installs streamlit/pandas/plotly
+poetry run streamlit run gui/app.py
+```
+
+Then open the URL Streamlit prints (defaults to <http://localhost:8501>).
+
+Sidebar workflow:
+1. Enter a log directory — recursively scanned for `*.wpilog`.
+2. Pick which matches to include (defaults to all).
+3. Toggle which analyses to run (Flywheel / Intake / Joystick).
+4. Each analysis renders as its own tab with two sub-tabs: **Per match** (drill into one match) and **Season** (aggregate across all selected matches).
+
+Results are cached per `(log_path, mtime, kind)`. Re-runs are instant for unchanged files; only newly added or overwritten logs get re-parsed. Use **Rescan / clear cache** in the sidebar to force a full reload.
+
+### GUI architecture
+
+```
+gui/
+├── app.py             # Streamlit entry point — sidebar + top-level tabs
+├── data.py            # find_logs, cached_analyze (@st.cache_data), load_results, capture_text
+├── components.py      # per_match_picker, raw_report, empty_state
+└── tabs/
+    ├── flywheel.py    # render(), render_per_log(), render_combined()
+    ├── intake.py
+    └── joystick.py
+```
+
+Contract every tab module satisfies:
+
+1. **`render(results: list[dict]) -> None`** — entry point called from `app.py` once per kind. Renders an empty state if `results` is empty; otherwise renders the per-match + season sub-tabs.
+2. **`render_per_log(r: dict)`** — consumes one `analyze_log()` result dict. Top section is `st.metric` cards for headline numbers, then `st.dataframe` tables, then optional `st.plotly_chart` figures.
+3. **`render_combined(results)`** — season aggregate: per-match summary table, totals, and at least one chart.
+4. **Raw text fallback** — every tab calls `raw_report(capture_text(<script>.print_per_log_report, r))` so the existing CLI text output is always available behind an expander, with no risk of feature drift if a structured renderer misses a field.
+
+The GUI does **not** duplicate analysis logic — it only imports `analyze_log` from each script and wraps it in `@st.cache_data`. All compute lives in `analysis/`; tabs are presentation only.
+
+### Adding a tab for a new analysis
+
+When you add a new analysis script (see steps above), wire it into the GUI:
+
+1. Register the script's module in `gui/data.py`'s `ANALYSES` dict.
+2. Copy `gui/tabs/intake.py` as a template — it's the smallest tab. Rewrite `render_per_log` / `render_combined` to consume the new result dict.
+3. Import the module in `gui/app.py` and add its short name to `ALL_KINDS` and to the `tab_modules` mapping.
+
+That is the entire GUI contribution — no app-shell changes required. The cache, sidebar, tab management, and raw-text fallback all work unchanged.
 
 ## Notes
 Vlogger uses the `logging` library internally to log information about the sources, but by design does not configure the logger at all. This means that program that uses Vlogger has the responsibility of setting up the logger.
