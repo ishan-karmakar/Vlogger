@@ -69,23 +69,23 @@ def _render_joystick_block(role_id: int, jdata: dict) -> None:
     axes_df = _axes_df(role_id, jdata.get("axes", {}))
     if not axes_df.empty:
         st.markdown("**Axis activity** (teleop only)")
-        st.dataframe(axes_df, hide_index=True, use_container_width=True)
+        st.dataframe(axes_df, hide_index=True, width="stretch")
 
     btns_df = _buttons_df(role_id, jdata.get("buttons", {}))
     if not btns_df.empty:
         c1, c2 = st.columns([3, 2])
         with c1:
             st.markdown("**Button presses** (rising edges, teleop)")
-            st.dataframe(btns_df, hide_index=True, use_container_width=True)
+            st.dataframe(btns_df, hide_index=True, width="stretch")
         with c2:
             fig = px.bar(btns_df, x="Label", y="Presses",
                          title=f"Button presses — {role}")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     povs_df = _povs_df(role_id, jdata.get("povs", {}))
     if not povs_df.empty:
         st.markdown("**POV / D-pad presses**")
-        st.dataframe(povs_df, hide_index=True, use_container_width=False)
+        st.dataframe(povs_df, hide_index=True, width="content")
 
 
 def render_per_log(r: dict) -> None:
@@ -119,7 +119,7 @@ def render_combined(results: list[dict]) -> None:
             row[f"{tag} pov presses"] = sum(jdata.get("povs", {}).values())
         rows.append(row)
     summary = pd.DataFrame(rows)
-    st.dataframe(summary, hide_index=True, use_container_width=True)
+    st.dataframe(summary, hide_index=True, width="stretch")
 
     # Aggregate button presses across matches per joystick
     role_button_totals: dict[tuple[int, str, int], int] = {}
@@ -140,7 +140,7 @@ def render_combined(results: list[dict]) -> None:
         st.markdown("**Total button presses across season**")
         fig = px.bar(bt_df, x="Button", y="Presses", color="Role", barmode="group",
                      title="Season-wide button presses")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     raw_report(capture_text(joystick_analysis.print_combined_analysis, results),
                label="Raw text season summary")

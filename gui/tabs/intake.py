@@ -33,7 +33,7 @@ def render_per_log(r: dict) -> None:
         t = r["state_time"].get(st_name, 0.0)
         pct = (100 * t / r["session_len"]) if r["session_len"] > 0 else 0.0
         rows.append({"State": st_name, "Time (s)": round(t, 1), "% of log": round(pct, 1)})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=False)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="content")
 
     # Current draw summary
     st.markdown("**Current draw**")
@@ -42,7 +42,7 @@ def render_per_log(r: dict) -> None:
     )
     cs["Mean (A)"] = cs["Mean (A)"].round(1)
     cs["Peak (A)"] = cs["Peak (A)"].round(1)
-    st.dataframe(cs, hide_index=True, use_container_width=False)
+    st.dataframe(cs, hide_index=True, width="content")
 
     # INTAKING cycles
     if r["cycles"]:
@@ -62,7 +62,7 @@ def render_per_log(r: dict) -> None:
             "I_sup_avg": "I_sup avg",   "I_sup_pk": "I_sup pk",
             "E_J": "Energy (J)", "jams": "Jams",
         })
-        st.dataframe(view, hide_index=True, use_container_width=True)
+        st.dataframe(view, hide_index=True, width="stretch")
 
         # Per-cycle energy bar chart
         chart_df = cdf.reset_index().rename(columns={"index": "Cycle #"})
@@ -73,7 +73,7 @@ def render_per_log(r: dict) -> None:
             labels={"E_J": "Energy (J)"},
             title="Energy per INTAKING cycle",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.caption("No INTAKING cycles in this log.")
 
@@ -86,7 +86,7 @@ def render_per_log(r: dict) -> None:
             "time": "Time (s)", "cycle": "During cycle", "state": "State at t",
         })
         view["Time (s)"] = view["Time (s)"].round(2)
-        st.dataframe(view, hide_index=True, use_container_width=False)
+        st.dataframe(view, hide_index=True, width="content")
 
     # SHOOTING windows
     if r["shooting_cycles"]:
@@ -96,7 +96,7 @@ def render_per_log(r: dict) -> None:
             "t_start": "Start (s)", "t_end": "End (s)", "dur": "Dur (s)",
             "E_J": "Energy (J)", "I_stat_avg": "I_stat avg (A)",
         })
-        st.dataframe(view, hide_index=True, use_container_width=False)
+        st.dataframe(view, hide_index=True, width="content")
 
     raw_report(capture_text(intake_analysis.print_per_log_report, r))
 
@@ -115,7 +115,7 @@ def render_combined(results: list[dict]) -> None:
             "Energy (kJ)":    round(r["total_energy_J"] / 1000, 2),
         })
     summary_df = pd.DataFrame(rows)
-    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+    st.dataframe(summary_df, hide_index=True, width="stretch")
 
     # Aggregates
     n = len(results)
@@ -139,7 +139,7 @@ def render_combined(results: list[dict]) -> None:
     )
     fig = px.bar(long, x="Match", y="Cycles", color="State",
                  title="Per-match cycle counts", barmode="stack")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # Aggregate INTAKING cycle stats
     all_cycles = [c for r in results for c in r["cycles"]]
@@ -163,7 +163,7 @@ def render_combined(results: list[dict]) -> None:
             title="Distribution of INTAKING cycle durations (all matches)",
             labels={"dur": "Duration (s)"},
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     raw_report(capture_text(intake_analysis.print_combined_analysis, results),
                label="Raw text season summary")

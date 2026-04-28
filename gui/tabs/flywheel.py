@@ -42,7 +42,7 @@ def render_per_log(r: dict) -> None:
             "aim_mode": "Aim mode", "drive_state": "Drive state",
             "align_t_s": "Align (s)", "t_xmode_s": "X-mode (s)",
         })
-        st.dataframe(view, hide_index=True, use_container_width=True)
+        st.dataframe(view, hide_index=True, width="stretch")
 
         # Spin-up time per cycle
         chart_df = cdf.reset_index().rename(columns={"index": "Cycle #"})
@@ -53,7 +53,7 @@ def render_per_log(r: dict) -> None:
             title="Spin-up time per cycle",
             labels={"spinup_s": "Spin-up time (s)"},
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.caption("No shoot cycles detected in this log.")
 
@@ -75,7 +75,7 @@ def render_combined(results: list[dict]) -> None:
             "Peak I (A)":    round(r["peak_I_tot"], 1),
         })
     summary_df = pd.DataFrame(rows)
-    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+    st.dataframe(summary_df, hide_index=True, width="stretch")
 
     # Aggregates
     n = len(results)
@@ -94,7 +94,7 @@ def render_combined(results: list[dict]) -> None:
 
     # Per-match cycle count
     fig1 = px.bar(summary_df, x="Match", y="Cycles", title="Per-match shoot cycle count")
-    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig1, width="stretch")
 
     # Spin-up time distribution across all cycles
     if all_cycles:
@@ -104,7 +104,7 @@ def render_combined(results: list[dict]) -> None:
             title="Distribution of spin-up times (all matches)",
             labels={"spinup_s": "Spin-up (s)"},
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     raw_report(capture_text(flywheel_analysis.print_combined_analysis, results),
                label="Raw text season summary")

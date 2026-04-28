@@ -92,7 +92,7 @@ def _sidebar() -> tuple[list[str], list[str]]:
     if "log_dir" not in st.session_state:
         st.session_state.log_dir = DEFAULT_LOG_DIR
 
-    if st.sidebar.button("Browse for folder…", use_container_width=True):
+    if st.sidebar.button("Browse for folder…", width="stretch"):
         chosen = _pick_folder()
         if chosen:
             st.session_state.log_dir = chosen
@@ -186,7 +186,7 @@ def main() -> None:
             "Re-run",
             help="Discard cached results (memory + on-disk pickles) for the "
                  "selected matches & analyses, then re-analyze from scratch.",
-            use_container_width=True,
+            width="stretch",
         ):
             removed = invalidate_disk_cache(selected_paths, kinds)
             st.cache_data.clear()
