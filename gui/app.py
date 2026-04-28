@@ -38,15 +38,11 @@ LOGO_PATH = str(Path(__file__).resolve().parent / "assets" / "valor_logo.png")
 
 ALL_KINDS = ("flywheel", "intake", "joystick", "drivetrain")
 
-st.set_page_config(
-    page_title="vlogger — match analysis",
-    page_icon=LOGO_PATH,
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# App-level branding: shown in the top-left header and shrunk in the sidebar header.
-st.logo(LOGO_PATH, size="large")
+# NB: set_page_config + st.logo were previously at module scope. They moved
+# into main() so worker subprocesses (which on Windows re-import this file
+# via multiprocessing.spawn) don't fire them and flood logs with
+# "missing ScriptRunContext" warnings. Streamlit treats repeated identical
+# set_page_config calls as a no-op, so calling on every rerender is fine.
 
 
 def _pick_folder() -> str | None:
@@ -117,13 +113,13 @@ def _sidebar() -> tuple[list[str], list[str], bool]:
     logs = find_logs(log_dir)
     if not log_dir:
         st.sidebar.info("Enter a log directory above to get started.")
-        return [], kinds
+        return [], kinds, skip_hoot
     if not os.path.isdir(log_dir):
         st.sidebar.error(f"Directory not found: `{log_dir}`")
-        return [], kinds
+        return [], kinds, skip_hoot
     if not logs:
         st.sidebar.warning("No `.wpilog` files found in this directory.")
-        return [], kinds
+        return [], kinds, skip_hoot
 
     st.sidebar.caption(f"Found **{len(logs)}** log file{'s' if len(logs) != 1 else ''}.")
 
@@ -168,6 +164,15 @@ def _run_and_render(tab_module, results: list[dict]) -> None:
 
 
 def main() -> None:
+    st.set_page_config(
+        page_title="vlogger — match analysis",
+        page_icon=LOGO_PATH,
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    # App-level branding: shown in the top-left header and shrunk in the sidebar.
+    st.logo(LOGO_PATH, size="large")
+
     selected_paths, kinds, skip_hoot = _sidebar()
 
     st.title("Match analysis")
@@ -278,4 +283,11 @@ def main() -> None:
             _run_and_render(tab_modules[k], by_kind[k][0])
 
 
-main()
+# On Windows the parallel pool uses `spawn`, which re-imports __main__ in
+# each worker and runs everything at module scope. Without this guard
+# main() would run inside every spawned worker, flooding the parent with
+# "missing ScriptRunContext" warnings and (worse) hitting the no-runtime
+# error path. Streamlit sets __name__ to "__main__" for the entry script;
+# spawn workers set it to "__mp_main__".
+if __name__ == "__main__":
+    main()
