@@ -185,7 +185,64 @@ def main() -> None:
         )
         return
 
-    # Run all selected analyses up-front (cached, so subsequent reruns are fast).
+    # Analysis gate: don't auto-run on every checkbox toggle. Selection
+    # changes are cheap (Streamlit re-runs the script on each interaction);
+    # we only kick off the slow load_results when the user explicitly clicks.
+    # `analyzed_signature` is the (paths, kinds, skip_hoot) tuple last analyzed
+    # — when it matches the current selection, results are still in cache and
+    # we re-render; when it changes, we wait for another Analyze click.
+    selection_signature = (tuple(selected_paths), tuple(kinds), bool(skip_hoot))
+
+    # Toolbar: selection summary + Clear cache + Analyze.
+    col_msg, col_clear, col_run = st.columns([4, 1, 1])
+    with col_msg:
+        st.markdown(
+            f"**{len(selected_paths)} match{'es' if len(selected_paths) != 1 else ''}** "
+            f"selected · queued: {', '.join(kinds)}"
+            + ("  · _hoot pairing skipped_" if skip_hoot else "")
+        )
+    with col_clear:
+        clear_clicked = st.button(
+            "Clear cache",
+            help="Delete cached results (memory + on-disk pickles) for the "
+                 "selected matches & analyses. Click Analyze afterwards to "
+                 "re-compute.",
+            width="stretch",
+        )
+    with col_run:
+        analyze_clicked = st.button(
+            "Analyze",
+            type="primary",
+            help="Run the selected analyses across the selected matches.",
+            width="stretch",
+        )
+
+    if clear_clicked:
+        removed = invalidate_disk_cache(selected_paths, kinds)
+        st.cache_data.clear()
+        # Force the next Analyze click to actually run; without dropping the
+        # signature, a subsequent rerender would still consider the selection
+        # "already analyzed" and skip the load.
+        st.session_state.pop("analyzed_signature", None)
+        st.toast(
+            f"Cleared {removed} disk cache file{'s' if removed != 1 else ''} "
+            "+ in-memory cache. Click Analyze to re-compute."
+        )
+        st.rerun()
+
+    if analyze_clicked:
+        st.session_state["analyzed_signature"] = selection_signature
+
+    if st.session_state.get("analyzed_signature") != selection_signature:
+        st.info(
+            "Adjust your selection in the sidebar, then click **Analyze** to run.\n\n"
+            "_Selection changes don't trigger work until you click Analyze, "
+            "so you can freely tweak match/analysis toggles before committing._"
+        )
+        return
+
+    # Either the user just clicked Analyze, or the cache is already populated
+    # for this exact selection — load_results hits cache fast either way.
     by_kind: dict[str, tuple[list[dict], list[str], dict]] = {}
     total_cached = total_fresh = 0
     for k in kinds:
@@ -200,32 +257,13 @@ def main() -> None:
                 + (" ..." if len(failed) > 5 else "")
             )
 
-    # Toolbar: status caption (with cache breakdown) + Re-run button.
-    col_msg, col_btn = st.columns([5, 1])
-    with col_msg:
-        parts = [
-            f"**{len(selected_paths)} match{'es' if len(selected_paths) != 1 else ''}** selected",
-            f"running: {', '.join(kinds)}",
-        ]
-        if total_cached:
-            parts.append(f"{total_cached} from cache")
-        if total_fresh:
-            parts.append(f"{total_fresh} freshly analyzed")
-        st.caption(" · ".join(parts))
-    with col_btn:
-        if st.button(
-            "Re-run",
-            help="Discard cached results (memory + on-disk pickles) for the "
-                 "selected matches & analyses, then re-analyze from scratch.",
-            width="stretch",
-        ):
-            removed = invalidate_disk_cache(selected_paths, kinds)
-            st.cache_data.clear()
-            st.toast(
-                f"Cleared {removed} disk cache file{'s' if removed != 1 else ''} "
-                "+ in-memory cache — re-analyzing."
-            )
-            st.rerun()
+    # Status caption with cache breakdown.
+    parts = [f"running: {', '.join(kinds)}"]
+    if total_cached:
+        parts.append(f"{total_cached} from cache")
+    if total_fresh:
+        parts.append(f"{total_fresh} freshly analyzed")
+    st.caption(" · ".join(parts))
 
     # Tabs (only shown for enabled analyses)
     tab_modules = {
