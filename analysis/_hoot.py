@@ -38,7 +38,9 @@ Usage in an analysis script:
 
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -126,6 +128,19 @@ def load_into_raw(raw, src):
 def attach_paired_hoots(raw, wpilog_path, hoot_regex, *, bus="canivore"):
     """Best-effort: find paired hoots for `wpilog_path` and merge their data.
 
+    Drives owlet directly rather than going through `vlogger.hoot`, for two
+    real-world reasons:
+
+      1. **Tolerate non-zero owlet exits when partial output exists.** Match
+         hoots routinely end mid-write (robot disabled abruptly), and owlet
+         reports `Could not read to end of input file: No error` and exits 1
+         — but only after emitting a perfectly usable partial wpilog. The
+         vlogger source uses `check_call` and raises, throwing the data away.
+      2. **Read every rollover file owlet produces.** Owlet caps each output
+         wpilog at 1 GB and starts `hoot.2.wpilog`, `hoot.3.wpilog`, etc. for
+         long matches. `vlogger.hoot` only opens the first file, so the tail
+         is silently lost on big logs.
+
     Imports `vlogger` lazily so this module can also be used standalone (e.g.
     from a test or REPL) without the `sys.path` setup the analysis scripts do.
 
@@ -135,8 +150,8 @@ def attach_paired_hoots(raw, wpilog_path, hoot_regex, *, bus="canivore"):
       - no paired hoot files match the requested bus.
 
     Returns the list of hoot files that were successfully merged (possibly
-    empty). Per-file conversion failures are logged to stderr and skipped — one
-    bad hoot doesn't abort the whole match.
+    empty). Per-file failures are logged to stderr and skipped — one bad hoot
+    doesn't abort the whole match.
     """
     import vlogger  # noqa: PLC0415 — lazy so this module is importable on its own
 
@@ -145,14 +160,47 @@ def attach_paired_hoots(raw, wpilog_path, hoot_regex, *, bus="canivore"):
     owlet = find_owlet()
     if not owlet:
         return []
+
     used = []
     for hpath in find_paired_hoots(wpilog_path, bus=bus):
+        tmpdir = tempfile.mkdtemp(prefix="vlogger_hoot_")
+        out_base = os.path.join(tmpdir, "hoot.wpilog")
         try:
-            hsrc = vlogger.get_source(f"hoot:///{hpath}", hoot_regex, owlet=owlet)
-            load_into_raw(raw, hsrc)
+            proc = subprocess.run(
+                [owlet, hpath, out_base, "-f", "wpilog"],
+                stdout=subprocess.DEVNULL,    # silence owlet's progress bar
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            # owlet rolls over at 1 GB → hoot.wpilog, hoot.2.wpilog, ...
+            outputs = sorted(Path(tmpdir).glob("hoot*.wpilog"))
+            if not outputs:
+                stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
+                sys.stderr.write(
+                    f"[hoot] {os.path.basename(hpath)}: owlet rc={proc.returncode}, "
+                    f"no output produced. {stderr_tail[-1]}\n"
+                )
+                continue
+
+            if proc.returncode != 0:
+                stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
+                sys.stderr.write(
+                    f"[hoot] {os.path.basename(hpath)}: owlet rc={proc.returncode}, "
+                    f"using partial output "
+                    f"({len(outputs)} file{'s' if len(outputs) != 1 else ''}). "
+                    f"{stderr_tail[-1]}\n"
+                )
+
+            for opath in outputs:
+                wpisrc = vlogger.get_source(f"wpilog:///{opath}", hoot_regex)
+                load_into_raw(raw, wpisrc)
             used.append(hpath)
         except Exception as e:                              # noqa: BLE001
-            sys.stderr.write(f"[hoot] couldn't open {hpath}: {e}\n")
+            sys.stderr.write(f"[hoot] {os.path.basename(hpath)}: {e}\n")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
     return used
 
 
