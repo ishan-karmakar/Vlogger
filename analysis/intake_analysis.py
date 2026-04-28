@@ -36,6 +36,7 @@ DEFAULT_LOG = os.path.abspath(os.path.join(
 )).replace("\\", "/")
 
 INTAKE_REGEX = r"NT:/SmartDashboard/Intake/(Intake State|Intake Jam|(Left|Right) Intake Motor/(Speed|Stator Current|Supply Current|Out Volt|reqSpeed))"
+REGEX = INTAKE_REGEX  # canonical name for the GUI's combined-decode path
 
 L_SPEED    = "NT:/SmartDashboard/Intake/Left Intake Motor/Speed"
 L_STATOR   = "NT:/SmartDashboard/Intake/Left Intake Motor/Stator Current"
@@ -63,6 +64,17 @@ def progress(msg):
 
 # -- Data loading ----------------------------------------------------------------
 
+def coerce_value(val):
+    """Per-module value coercion used by load_series and the GUI's combined decoder.
+    Returns the coerced value or None to skip."""
+    if isinstance(val, bool):
+        return bool(val)
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        return val
+    return None
+
 def load_series(log_path):
     raw = defaultdict(list)
     url = f"wpilog:///{log_path}" if not log_path.startswith("wpilog:") else log_path
@@ -71,13 +83,9 @@ def load_series(log_path):
         for entry in src:
             name = entry["name"]
             ts   = entry["timestamp"] / 1e6
-            val  = entry["data"]
-            if isinstance(val, bool):
-                raw[name].append((ts, bool(val)))
-            elif isinstance(val, (int, float)):
-                raw[name].append((ts, float(val)))
-            elif isinstance(val, str):
-                raw[name].append((ts, val))
+            v    = coerce_value(entry["data"])
+            if v is not None:
+                raw[name].append((ts, v))
     for name in raw:
         raw[name].sort(key=lambda x: x[0])
     return dict(raw)
@@ -153,9 +161,15 @@ def count_jams_in_window(jam_pts, t_start, t_end):
 # -- Per-log analysis ------------------------------------------------------------
 
 def analyze_log(log_path):
-    """Run per-log intake analysis and return a result dict, or None if required signals missing."""
-    series = load_series(log_path)
+    """Decode the log and run the analysis. Thin wrapper over analyze_from_series."""
+    return analyze_from_series(load_series(log_path), log_path)
 
+def analyze_from_series(series, log_path):
+    """Run the intake analysis on an already-decoded series dict. Returns a
+    result dict, or None if required signals are missing.
+
+    Split out so the GUI can decode a wpilog once and run multiple analyses
+    against the same series dict (see gui/data.py:load_combined_series)."""
     ts_ls,  l_speed    = to_np(series, L_SPEED)
     ts_lsc, l_stator   = to_np(series, L_STATOR)
     ts_lsp, l_supply   = to_np(series, L_SUPPLY)

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from gui.data import find_logs, load_results, match_label
+from gui.data import find_logs, load_results_multi, match_label
 from gui.tabs import flywheel as flywheel_tab
 from gui.tabs import intake as intake_tab
 from gui.tabs import joystick as joystick_tab
@@ -53,6 +53,10 @@ def _sidebar() -> tuple[list[str], list[str]]:
 
     if st.sidebar.button("Rescan / clear cache", use_container_width=True):
         st.cache_data.clear()
+        # Also drop our in-session "already-batched" memo so the next rerun
+        # re-batches via the worker pool instead of falling into the slow
+        # inline analyze_log path on a now-empty cache.
+        st.session_state.pop("_vlogger_seen", None)
         st.toast("Cache cleared — logs will be re-parsed.", icon="↻")
 
     # -- Log discovery
@@ -117,11 +121,11 @@ def main() -> None:
         f"running: {', '.join(kinds)}"
     )
 
-    # Run all selected analyses up-front (cached, so subsequent reruns are fast).
-    by_kind: dict[str, tuple[list[dict], list[str]]] = {}
-    for k in kinds:
-        ok, failed = load_results(selected_paths, k)
-        by_kind[k] = (ok, failed)
+    # Decode every selected log ONCE in a process pool, run every requested
+    # analysis against the same series dict, and cache results on disk so
+    # re-runs are instant. See gui/data.py:load_results_multi.
+    by_kind = load_results_multi(selected_paths, kinds)
+    for k, (_, failed) in by_kind.items():
         if failed:
             st.warning(
                 f"{k}: {len(failed)} log(s) had no usable data — "

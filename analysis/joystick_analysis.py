@@ -41,6 +41,7 @@ DEFAULT_LOG = os.path.abspath(os.path.join(
 )).replace("\\", "/")
 
 JS_REGEX = r"(DS:joystick[0-9]+/(axes|buttons|povs)|DS:(enabled|autonomous))"
+REGEX = JS_REGEX  # canonical name for the GUI's combined-decode path
 
 # Which joysticks to analyze, plus human-readable role labels.
 # Based on the season logs: joystick1 is the active driver controller (heavy
@@ -180,6 +181,11 @@ def progress(msg):
 
 # -- Data loading ----------------------------------------------------------------
 
+def coerce_value(val):
+    """Per-module value coercion used by load_series and the GUI's combined decoder.
+    Joystick analysis preserves all values (axes/buttons/POVs are lists)."""
+    return val
+
 def load_series(log_path):
     """Return dict: name -> list[(ts_s, value)]. Preserves list values as-is."""
     raw = defaultdict(list)
@@ -189,8 +195,7 @@ def load_series(log_path):
         for entry in src:
             name = entry["name"]
             ts   = entry["timestamp"] / 1e6
-            val  = entry["data"]
-            raw[name].append((ts, val))
+            raw[name].append((ts, coerce_value(entry["data"])))
     for name in raw:
         raw[name].sort(key=lambda x: x[0])
     return dict(raw)
@@ -461,7 +466,15 @@ def compute_pov_presses(pov_pts, intervals):
 # -- Per-log analysis ------------------------------------------------------------
 
 def analyze_log(log_path):
-    series = load_series(log_path)
+    """Decode the log and run the analysis. Thin wrapper over analyze_from_series."""
+    return analyze_from_series(load_series(log_path), log_path)
+
+def analyze_from_series(series, log_path):
+    """Run the joystick analysis on an already-decoded series dict. Returns a
+    result dict, or None if no input data was logged.
+
+    Split out so the GUI can decode a wpilog once and run multiple analyses
+    against the same series dict (see gui/data.py:load_combined_series)."""
     enabled_pts = series.get("DS:enabled", [])
     auto_pts    = series.get("DS:autonomous", [])
 
