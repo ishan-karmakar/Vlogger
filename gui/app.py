@@ -74,8 +74,8 @@ def _pick_folder() -> str | None:
     return path or None
 
 
-def _sidebar() -> tuple[list[str], list[str]]:
-    """Render the sidebar. Returns (selected_log_paths, selected_kinds)."""
+def _sidebar() -> tuple[list[str], list[str], bool]:
+    """Render the sidebar. Returns (selected_log_paths, selected_kinds, skip_hoot)."""
     st.sidebar.title("vlogger")
     st.sidebar.caption("Post-match analysis · Valor 6800")
 
@@ -85,6 +85,15 @@ def _sidebar() -> tuple[list[str], list[str]]:
     for k in ALL_KINDS:
         if st.sidebar.checkbox(k.capitalize(), value=False, key=f"toggle_{k}"):
             kinds.append(k)
+
+    skip_hoot = st.sidebar.checkbox(
+        "Skip hoot pairing",
+        value=False,
+        key="skip_hoot",
+        help="Skip the per-motor hoot data (DeviceTemp, SupplyCurrent, "
+             "TorqueCurrent). Cuts first-load time from minutes to seconds, "
+             "but drops the motor-telemetry section in each tab.",
+    )
 
     st.sidebar.divider()
 
@@ -151,7 +160,7 @@ def _sidebar() -> tuple[list[str], list[str]]:
     )
     selected_paths = [label_to_path[l] for l in selected_labels]
 
-    return selected_paths, kinds
+    return selected_paths, kinds, skip_hoot
 
 
 def _run_and_render(tab_module, results: list[dict]) -> None:
@@ -159,7 +168,7 @@ def _run_and_render(tab_module, results: list[dict]) -> None:
 
 
 def main() -> None:
-    selected_paths, kinds = _sidebar()
+    selected_paths, kinds, skip_hoot = _sidebar()
 
     st.title("Match analysis")
 
@@ -180,7 +189,7 @@ def main() -> None:
     by_kind: dict[str, tuple[list[dict], list[str], dict]] = {}
     total_cached = total_fresh = 0
     for k in kinds:
-        ok, failed, counts = load_results(selected_paths, k)
+        ok, failed, counts = load_results(selected_paths, k, skip_hoot=skip_hoot)
         by_kind[k] = (ok, failed, counts)
         total_cached += counts["cached"]
         total_fresh  += counts["fresh"]

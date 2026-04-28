@@ -13,6 +13,10 @@ analysis/reports/
 # GUI on-disk analysis cache (pickle files written next to *.wpilog)
 .vlogger_cache/
 
+# Persistent cache of hoot → wpilog conversions (skips ~1-2 min owlet runs).
+# Each entry can be ~1 GB; safe to wipe to reclaim disk.
+.vlogger_hoot_cache/
+
 .venv/
 
 # Byte-compiled / optimized / DLL files

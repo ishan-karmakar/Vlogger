@@ -31,6 +31,7 @@ if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from analysis import (  # noqa: E402
+    _hoot,
     drivetrain_analysis,
     flywheel_analysis,
     intake_analysis,
@@ -55,7 +56,10 @@ ANALYSES = {
 # v4: same hoot pairing extended to flywheel (CAN 30/31/32 on canivore) and
 #     intake (CAN 12/13 on rio). Result dicts gain hoot_motors list,
 #     hoot_files_used, max_motor_temp_c.
-CACHE_VERSION = 4
+# v5: skip_hoot toggle baked into the cache filename so hoot/no-hoot results
+#     don't collide. Pickles compute identically across versions but the file
+#     path was renamed.
+CACHE_VERSION = 5
 CACHE_DIR_NAME = ".vlogger_cache"
 
 
@@ -80,14 +84,15 @@ def match_label(log_path: str) -> str:
     return f"{parent}/{p.stem}" if parent else p.stem
 
 
-def _disk_cache_path(log_path: str, kind: str) -> Path:
+def _disk_cache_path(log_path: str, kind: str, *, skip_hoot: bool = False) -> Path:
     log = Path(log_path)
-    return log.parent / CACHE_DIR_NAME / f"{log.stem}.{kind}.v{CACHE_VERSION}.pkl"
+    suffix = ".no_hoot" if skip_hoot else ""
+    return log.parent / CACHE_DIR_NAME / f"{log.stem}.{kind}{suffix}.v{CACHE_VERSION}.pkl"
 
 
-def _load_from_disk(log_path: str, mtime: float, kind: str):
+def _load_from_disk(log_path: str, mtime: float, kind: str, *, skip_hoot: bool = False):
     """Return the cached result dict, or None on miss / mismatch / corrupt file."""
-    p = _disk_cache_path(log_path, kind)
+    p = _disk_cache_path(log_path, kind, skip_hoot=skip_hoot)
     if not p.is_file():
         return None
     try:
@@ -100,10 +105,10 @@ def _load_from_disk(log_path: str, mtime: float, kind: str):
     return entry.get("result")
 
 
-def _save_to_disk(log_path: str, mtime: float, kind: str, result) -> None:
+def _save_to_disk(log_path: str, mtime: float, kind: str, result, *, skip_hoot: bool = False) -> None:
     """Atomically write the result to disk. Cache write failures are swallowed
     so a read-only disk doesn't break analysis."""
-    p = _disk_cache_path(log_path, kind)
+    p = _disk_cache_path(log_path, kind, skip_hoot=skip_hoot)
     tmp = p.with_suffix(p.suffix + ".tmp")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -123,47 +128,63 @@ def _save_to_disk(log_path: str, mtime: float, kind: str, result) -> None:
 
 
 def invalidate_disk_cache(log_paths: list[str], kinds: list[str]) -> int:
-    """Delete cache files for the given (path, kind) pairs. Returns count removed."""
+    """Delete cache files for the given (path, kind) pairs across both
+    skip_hoot variants. Returns count removed."""
     removed = 0
     for path in log_paths:
         for kind in kinds:
-            p = _disk_cache_path(path, kind)
-            if p.is_file():
-                try:
-                    p.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+            for skip_hoot in (False, True):
+                p = _disk_cache_path(path, kind, skip_hoot=skip_hoot)
+                if p.is_file():
+                    try:
+                        p.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
     return removed
 
 
 @st.cache_data(show_spinner=False, max_entries=500)
-def cached_analyze(log_path: str, mtime: float, kind: str) -> dict:
+def cached_analyze(log_path: str, mtime: float, kind: str,
+                   skip_hoot: bool = False, _on_progress=None) -> dict:
     """Cached wrapper around per-analysis analyze_log().
 
-    Returns `{"result": dict | None, "source": "disk" | "fresh"}`.
-    Tries the on-disk pickle first; on miss runs analyze_log() and writes the
-    result back to disk for next time. `mtime` participates in the key so a file
-    edit invalidates the entry.
+    `skip_hoot` participates in the cache key so hoot / no-hoot results stay
+    distinct. `_on_progress` (leading underscore = ignored by Streamlit's
+    hashing) is plumbed through to `_hoot.set_progress_callback` for the
+    duration of one analyze_log call so the GUI can show inner status.
+
+    Returns `{"result": dict | None, "source": "disk" | "fresh"}`. Tries the
+    on-disk pickle first; on miss runs analyze_log() and writes the result back
+    to disk for next time.
     """
-    cached = _load_from_disk(log_path, mtime, kind)
+    cached = _load_from_disk(log_path, mtime, kind, skip_hoot=skip_hoot)
     if cached is not None:
         return {"result": cached, "source": "disk"}
-    result = ANALYSES[kind].analyze_log(log_path)
+
+    _hoot.set_skip(skip_hoot)
+    _hoot.set_progress_callback(_on_progress)
+    try:
+        result = ANALYSES[kind].analyze_log(log_path)
+    finally:
+        _hoot.set_progress_callback(None)
+        _hoot.set_skip(False)
+
     if result is not None:
-        _save_to_disk(log_path, mtime, kind, result)
+        _save_to_disk(log_path, mtime, kind, result, skip_hoot=skip_hoot)
     return {"result": result, "source": "fresh"}
 
 
-def load_results(log_paths: list[str], kind: str):
+def load_results(log_paths: list[str], kind: str, *, skip_hoot: bool = False):
     """Run cached_analyze() for each path.
 
     Returns `(ok_results, failed_paths, source_counts)` where source_counts is
     `{"cached": int, "fresh": int}` so the caller can show how many results
     came from disk vs were freshly computed.
 
-    A small Streamlit progress bar is shown while uncached files are processed.
-    Cached entries return instantly.
+    Streamlit's progress bar text reflects per-match status and (during a fresh
+    analysis) inner hoot-conversion progress so the UI doesn't look frozen
+    during the slow first load.
     """
     if not log_paths:
         return [], [], {"cached": 0, "fresh": 0}
@@ -171,7 +192,8 @@ def load_results(log_paths: list[str], kind: str):
     ok: list[dict] = []
     failed: list[str] = []
     counts = {"cached": 0, "fresh": 0}
-    bar = st.progress(0.0, text=f"Loading {kind} ({len(log_paths)} log{'s' if len(log_paths) != 1 else ''})...")
+    n = len(log_paths)
+    bar = st.progress(0.0, text=f"Loading {kind} ({n} log{'s' if n != 1 else ''})...")
     try:
         for i, p in enumerate(log_paths):
             try:
@@ -179,8 +201,16 @@ def load_results(log_paths: list[str], kind: str):
             except OSError:
                 failed.append(p)
                 continue
+            base_label = f"{kind} {i+1}/{n} · {os.path.basename(p)}"
+            bar.progress(i / n, text=f"Loading {base_label} …")
+
+            def _on_progress(msg: str, _label=base_label, _i=i, _n=n):
+                bar.progress(_i / _n, text=f"Loading {_label} — {msg}")
+
             try:
-                wrapped = cached_analyze(p, mtime, kind)
+                wrapped = cached_analyze(p, mtime, kind,
+                                         skip_hoot=skip_hoot,
+                                         _on_progress=_on_progress)
             except Exception as e:                      # noqa: BLE001
                 st.warning(f"{kind}: failed to analyze `{os.path.basename(p)}`: {e}")
                 failed.append(p)
@@ -192,10 +222,7 @@ def load_results(log_paths: list[str], kind: str):
             else:
                 ok.append(r)
                 counts["fresh" if src == "fresh" else "cached"] += 1
-            bar.progress(
-                (i + 1) / len(log_paths),
-                text=f"Loading {kind}... {i+1}/{len(log_paths)}",
-            )
+            bar.progress((i + 1) / n, text=f"Loading {kind} … {i+1}/{n}")
     finally:
         bar.empty()
     return ok, failed, counts
