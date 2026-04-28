@@ -138,11 +138,10 @@ def _sidebar() -> tuple[list[str], list[str]]:
             st.session_state.match_pick = current + new_labels
             st.toast(
                 f"Added {len(new_labels)} new match log"
-                f"{'s' if len(new_labels) != 1 else ''} to the selection.",
-                icon="↻",
+                f"{'s' if len(new_labels) != 1 else ''} to the selection."
             )
         else:
-            st.toast("No new match logs found.", icon="↻")
+            st.toast("No new match logs found.")
 
     selected_labels = st.sidebar.multiselect(
         "Matches",
@@ -215,8 +214,7 @@ def main() -> None:
             st.cache_data.clear()
             st.toast(
                 f"Cleared {removed} disk cache file{'s' if removed != 1 else ''} "
-                "+ in-memory cache — re-analyzing.",
-                icon="↻",
+                "+ in-memory cache — re-analyzing."
             )
             st.rerun()
 
