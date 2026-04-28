@@ -63,14 +63,23 @@ CACHE_VERSION = 5
 CACHE_DIR_NAME = ".vlogger_cache"
 
 
+_SKIP_DIRS = frozenset({CACHE_DIR_NAME, _hoot.HOOT_CACHE_DIR_NAME})
+
+
 def find_logs(directory: str) -> list[str]:
-    """Recursively scan a directory for *.wpilog files."""
+    """Recursively scan a directory for *.wpilog files.
+
+    Excludes our own cache directories — both the per-result analysis cache
+    (.vlogger_cache) and the owlet-output cache (.vlogger_hoot_cache). Without
+    the hoot-cache exclusion, the GB-sized converted hoot wpilogs get mistaken
+    for match logs, return None from every analyze_log (no NT signals match),
+    AND can OOM-kill workers in the parallel pool.
+    """
     if not directory or not os.path.isdir(directory):
         return []
     found: list[str] = []
     for root, dirs, files in os.walk(directory):
-        # Don't descend into our own cache dirs
-        dirs[:] = [d for d in dirs if d != CACHE_DIR_NAME]
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for f in files:
             if f.lower().endswith(".wpilog"):
                 found.append(os.path.abspath(os.path.join(root, f)))
@@ -324,6 +333,7 @@ def load_results(log_paths: list[str], kind: str, *, skip_hoot: bool = False):
                     _bump(p)
             else:
                 ex = _make_pool(n_workers)
+                pool_broken = False
                 try:
                     submitted = {
                         ex.submit(_worker.analyze_one, (p, kind, skip_hoot)):
@@ -334,6 +344,24 @@ def load_results(log_paths: list[str], kind: str, *, skip_hoot: bool = False):
                         idx, p, mtime = submitted[fut]
                         try:
                             _, _, result = fut.result()
+                        except concurrent.futures.process.BrokenProcessPool:
+                            # A worker died abruptly (OOM kill, segfault, etc.).
+                            # Every remaining future will raise the same thing;
+                            # surface ONE warning, mark every pending future as
+                            # failed, and bail out of the loop.
+                            if not pool_broken:
+                                st.error(
+                                    f"{kind}: worker process died abruptly while "
+                                    f"analyzing `{os.path.basename(p)}` (likely "
+                                    f"OOM). Remaining {kind} matches in this "
+                                    f"batch will be skipped — try reducing the "
+                                    f"selection, toggling **Skip hoot pairing**, "
+                                    f"or running with fewer matches at a time."
+                                )
+                                pool_broken = True
+                            failed.append(p)
+                            _bump(p)
+                            continue
                         except Exception as e:           # noqa: BLE001
                             st.warning(f"{kind}: failed to analyze "
                                        f"`{os.path.basename(p)}`: {e}")
