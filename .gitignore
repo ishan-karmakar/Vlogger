@@ -10,6 +10,9 @@ logs/
 # Generated analysis reports (all per-match + season markdown outputs)
 analysis/reports/
 
+# GUI on-disk analysis cache (pickle files written next to *.wpilog)
+.vlogger_cache/
+
 .venv/
 
 # Byte-compiled / optimized / DLL files
