@@ -30,18 +30,26 @@ if str(_REPO_ROOT) not in sys.path:
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from analysis import flywheel_analysis, intake_analysis, joystick_analysis  # noqa: E402
+from analysis import (  # noqa: E402
+    drivetrain_analysis,
+    flywheel_analysis,
+    intake_analysis,
+    joystick_analysis,
+)
 
 ANALYSES = {
-    "flywheel": flywheel_analysis,
-    "intake":   intake_analysis,
-    "joystick": joystick_analysis,
+    "flywheel":   flywheel_analysis,
+    "intake":     intake_analysis,
+    "joystick":   joystick_analysis,
+    "drivetrain": drivetrain_analysis,
 }
 
 # Bump when any analyze_log() return-dict shape changes — older pickles will be
 # treated as misses and re-analyzed. Without this, old caches could silently
 # feed stale dicts into the renderers.
-CACHE_VERSION = 1
+# v2: added drivetrain analysis (new kind; doesn't invalidate other kinds, but
+#     bumping is the simplest way to keep version monotonic).
+CACHE_VERSION = 2
 CACHE_DIR_NAME = ".vlogger_cache"
 
 

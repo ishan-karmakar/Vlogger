@@ -71,6 +71,11 @@ ANALYSES = [
         "script":      "joystick_analysis.py",
         "description": "Driver + operator gamepad input: axis activity, button presses, POV usage.",
     },
+    {
+        "name":        "drivetrain",
+        "script":      "drivetrain_analysis.py",
+        "description": "Per-module drive/azimuth currents + energy, ALIGN/X-mode windows, balance check.",
+    },
 ]
 
 def banner(msg, ch="="):

@@ -252,6 +252,29 @@ python -X utf8 analysis/joystick_analysis.py --serial logs/GF1/FRC_xxx.wpilog
 
 Outputs (default paths): `analysis/reports/joystick_summary.md`, `analysis/reports/joystick_matches.md`.
 
+### `analysis/drivetrain_analysis.py`
+
+Per-module swerve drivetrain analysis (CAN IDs 1–4 = drive, CAN IDs 5–8 = azimuth, indexed 0–3 in the WPI log under `SwerveDrive/Module N/`). Produces:
+- Per-match: for each module, peak drive speed, mean/peak stator current (drive + azimuth), drive + azimuth energy (∫|V|·|I| dt), drive setpoint tracking error (RPS), azimuth tracking error (degrees, wrap-aware). Chassis: total energy, peak yaw rate, net heading change. Drive-energy share + imbalance flag (>10% spread = IMBALANCED). Per-cycle table for every `ALIGN_TO_TARGET` window (start, duration, settle time, energy) and every `X_MODE` window. State distribution for both `Driver Rotation State` and `Driver Translation State`.
+- Season summary: per-match table, totals + per-match averages, per-module aggregate (drive % share + peak currents) with season-wide imbalance check, settle-time histogram across all aligns.
+
+Required log signals (under `SmartDashboard/SwerveDrive/`):
+- `Module [0-3]/Drive Motor/{Speed,Out Volt,Stator Current,Position,reqSpeed}`
+- `Module [0-3]/Azimuth Motor/{Speed,Out Volt,Stator Current,Position,Absolute Position,reqPosition}`
+- `Gyro Yaw`, `Angular Velocity`, `Driver Rotation State`, `Driver Translation State`, `Rotation Target`, `Max Rotational Velocity`
+- `DS:enabled`, `DS:autonomous`
+
+The script accepts both `*.wpilog` and `*.hoot` paths on the CLI (URL scheme switches automatically) — but the required signals above are NetworkTables fields, so a hoot-only input will return None. Hoot files require [`owlet`](https://docs.ctr-electronics.com/cli-tools.html) on `PATH`. A future iteration could merge a paired hoot file in for higher-rate motor data.
+
+```bash
+python -X utf8 analysis/drivetrain_analysis.py
+python -X utf8 analysis/drivetrain_analysis.py logs/
+python -X utf8 analysis/drivetrain_analysis.py -j 8 logs/
+python -X utf8 analysis/drivetrain_analysis.py --no-file logs/GF1/FRC_xxx.wpilog
+```
+
+Outputs (default paths): `analysis/reports/drivetrain_summary.md`, `analysis/reports/drivetrain_matches.md`.
+
 ### Notes on running the analysis scripts
 
 - On Windows, use `python -X utf8 ...` to avoid CP1252 encoding errors on some terminals.

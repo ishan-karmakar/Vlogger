@@ -26,6 +26,7 @@ from pathlib import Path
 import streamlit as st
 
 from gui.data import find_logs, invalidate_disk_cache, load_results, match_label
+from gui.tabs import drivetrain as drivetrain_tab
 from gui.tabs import flywheel as flywheel_tab
 from gui.tabs import intake as intake_tab
 from gui.tabs import joystick as joystick_tab
@@ -35,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DIR = str(REPO_ROOT / "logs")
 LOGO_PATH = str(Path(__file__).resolve().parent / "assets" / "valor_logo.png")
 
-ALL_KINDS = ("flywheel", "intake", "joystick")
+ALL_KINDS = ("flywheel", "intake", "joystick", "drivetrain")
 
 st.set_page_config(
     page_title="vlogger — match analysis",
@@ -221,9 +222,10 @@ def main() -> None:
 
     # Tabs (only shown for enabled analyses)
     tab_modules = {
-        "flywheel": flywheel_tab,
-        "intake":   intake_tab,
-        "joystick": joystick_tab,
+        "flywheel":   flywheel_tab,
+        "intake":     intake_tab,
+        "joystick":   joystick_tab,
+        "drivetrain": drivetrain_tab,
     }
     tabs = st.tabs([k.capitalize() for k in kinds])
     for tab, k in zip(tabs, kinds):
