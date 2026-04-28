@@ -49,10 +49,13 @@ UI integration (gui/data.py):
 """
 
 import os
+import pickle
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -62,9 +65,30 @@ import numpy as np
 # list costs little since the regex filters at the source level.
 DEFAULT_SIGNALS = ("DeviceTemp", "SupplyCurrent", "TorqueCurrent")
 
-# Persistent cache of converted hoot.wpilog files (alongside each *.hoot file).
-# Hoot → wpilog conversion takes 1-2 minutes per file via owlet; caching means
-# only the first run pays that cost. Keyed on hoot mtime baked into the filename.
+# Union of every CAN ID any analysis pulls from a paired hoot. Owlet's
+# converted wpilog is filtered through this regex at cache time, so the
+# persistent cache only stores signals an analyzer might actually read.
+# Cuts the on-disk footprint from ~1+ GB per match (owlet output, all
+# devices × all signals × full sample rate) down to a few tens of MB.
+#
+# Adding a new analysis with new CAN IDs requires:
+#   1. Append the IDs here.
+#   2. Bump HOOT_CACHE_VERSION so existing pkl caches are invalidated.
+UNIVERSAL_CAN_IDS = (
+    *range(1, 9),   # drivetrain (4 drive + 4 azimuth, IDs 1-8 on canivore)
+    12, 13,         # intake (rio bus, IDs 12-13)
+    30, 31, 32,     # flywheel (canivore bus, IDs 30-32)
+)
+
+# Bump when UNIVERSAL_CAN_IDS or DEFAULT_SIGNALS changes — older pkls are
+# treated as misses and re-converted from the source hoot.
+HOOT_CACHE_VERSION = 1
+
+# Persistent cache of filtered hoot data alongside each *.hoot file.
+# Pre-v1: cache held the multi-GB wpilog rollovers verbatim.
+# v1+: cache holds a single pickled `{signal_name: [(ts, val), ...]}` dict
+#      filtered through UNIVERSAL_HOOT_REGEX. Conversion still costs 1-2
+#      min via owlet on first run; subsequent loads read the small pkl.
 HOOT_CACHE_DIR_NAME = ".vlogger_hoot_cache"
 
 
@@ -157,70 +181,72 @@ def find_paired_hoots(wpilog_path, *, bus="canivore"):
     return sorted(set(hoots))
 
 
-# ---- Persistent cache of converted hoot.wpilog files ------------------------
+# ---- Persistent cache of filtered hoot series dicts -------------------------
 
 def _hoot_cache_dir(hoot_path) -> Path:
     return Path(hoot_path).parent / HOOT_CACHE_DIR_NAME
 
 
-def _cached_outputs(hoot_path):
-    """Return cached wpilog files for a hoot, or [] if no cache hit.
+def _filtered_cache_path(hoot_path):
+    """Pickle path for the filtered series dict, or None if mtime is unreadable.
 
-    Cache key is the hoot file's mtime — if the source hoot changes the cache
-    is invalidated automatically (any new conversion uses a new mtime in the
-    filename). All rollover files (`.wpilog`, `.2.wpilog`, ...) come back in
-    natural sort order.
+    Cache key is the source hoot's mtime + HOOT_CACHE_VERSION, both baked
+    into the filename. Source hoot replaced → new mtime → cache miss.
+    UNIVERSAL_CAN_IDS / DEFAULT_SIGNALS changed → bumped version → cache miss.
     """
     p = Path(hoot_path)
     try:
         mtime_int = int(p.stat().st_mtime)
     except OSError:
-        return []
-    cache_dir = _hoot_cache_dir(hoot_path)
-    if not cache_dir.is_dir():
-        return []
-    base = cache_dir / f"{p.stem}.{mtime_int}.wpilog"
-    if not base.is_file():
-        return []
-    rollovers = sorted(cache_dir.glob(f"{p.stem}.{mtime_int}.[0-9]*.wpilog"))
-    return [base, *rollovers]
+        return None
+    return _hoot_cache_dir(hoot_path) / f"{p.stem}.{mtime_int}.v{HOOT_CACHE_VERSION}.pkl"
 
 
-def _persist_outputs(hoot_path, tmp_outputs):
-    """Move owlet's temp `hoot[.N].wpilog` files into the persistent cache.
-
-    Returns the list of cached paths in load order. Cache files are named
-    `<hoot_stem>.<mtime>.wpilog`, `<hoot_stem>.<mtime>.2.wpilog`, etc. — the
-    mtime baked into the filename is what invalidates the cache when the hoot
-    is replaced (e.g. re-downloaded from the robot).
-    """
-    p = Path(hoot_path)
+def _load_filtered_pkl(pkl_path):
+    """Read a pickled filtered series dict, returning None on miss/corrupt."""
+    if pkl_path is None or not pkl_path.is_file():
+        return None
     try:
-        mtime_int = int(p.stat().st_mtime)
-    except OSError:
-        return [str(t) for t in tmp_outputs]  # can't read mtime, skip caching
-    cache_dir = _hoot_cache_dir(hoot_path)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cached = []
-    for src in tmp_outputs:
-        # owlet names: hoot.wpilog, hoot.2.wpilog, hoot.3.wpilog, ...
-        # cache names: <stem>.<mtime>.wpilog, <stem>.<mtime>.2.wpilog, ...
-        name = src.name
-        if name == "hoot.wpilog":
-            dst_name = f"{p.stem}.{mtime_int}.wpilog"
-        elif name.startswith("hoot.") and name.endswith(".wpilog"):
-            rollover = name[len("hoot."):-len(".wpilog")]   # "2", "3", ...
-            dst_name = f"{p.stem}.{mtime_int}.{rollover}.wpilog"
-        else:
-            dst_name = name  # unexpected; keep as-is
-        dst = cache_dir / dst_name
+        with open(pkl_path, "rb") as f:
+            return pickle.load(f)
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _save_filtered_pkl(pkl_path, series_dict):
+    """Atomically write the filtered series dict. Failures are swallowed so a
+    read-only disk doesn't break analysis."""
+    if pkl_path is None:
+        return
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = pkl_path.with_suffix(pkl_path.suffix + ".tmp")
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(series_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(pkl_path)                               # atomic on POSIX + Windows
+    except Exception as e:                                  # noqa: BLE001
+        sys.stderr.write(f"[hoot] cache write failed: {e}\n")
         try:
-            shutil.move(str(src), str(dst))
-            cached.append(dst)
-        except OSError as e:
-            sys.stderr.write(f"[hoot] couldn't cache {src.name} -> {dst}: {e}\n")
-            cached.append(src)  # fall back to the temp path; caller will read it
-    return cached
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _purge_legacy_wpilog_cache(cache_dir, hoot_stem, mtime_int):
+    """Delete the pre-v1 per-rollover wpilog cache files for this (stem, mtime).
+
+    Older versions of vlogger stored owlet's raw wpilog rollovers in the
+    cache (~1+ GB per match). Once the equivalent filtered pkl exists,
+    those rollovers are obsolete — drop them to reclaim disk.
+    """
+    if not cache_dir.is_dir():
+        return
+    for f in cache_dir.glob(f"{hoot_stem}.{mtime_int}*.wpilog"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
 
 
 # ---- Source ingestion -------------------------------------------------------
@@ -247,19 +273,25 @@ def load_into_raw(raw, src):
 
 
 def _convert_hoot(owlet, hoot_path):
-    """Run owlet on a single hoot, returning (output_paths, was_cached, error).
+    """Convert hoot → universal-filtered pickle. Returns (pkl_path_or_None, was_cached, error).
+
+    Cache hits skip owlet entirely. On a miss owlet runs once into a temp dir,
+    we decode every rollover wpilog through UNIVERSAL_HOOT_REGEX into a single
+    `{signal_name: [(ts, val), ...]}` dict, pickle it, and discard the multi-GB
+    rollovers. The pkl typically lands at 10-50 MB (vs 1+ GB raw owlet output)
+    because we only keep DEFAULT_SIGNALS for CAN IDs the analyses actually read.
 
     Tolerates non-zero owlet exit when partial output exists (truncated hoots
-    from mid-match disable still produce useful data). Reads all rollover files
-    owlet creates (`hoot.wpilog`, `hoot.2.wpilog`, ...). On a cache hit, owlet
-    is not invoked at all.
+    from mid-match disables still produce useful data).
 
     `error` is None on success or a short string for the stderr log.
     """
-    cached = _cached_outputs(hoot_path)
-    if cached:
+    import vlogger  # noqa: PLC0415 — lazy so this module is importable on its own
+
+    pkl = _filtered_cache_path(hoot_path)
+    if pkl is not None and pkl.is_file():
         _emit(f"cached {Path(hoot_path).name}")
-        return cached, True, None
+        return pkl, True, None
 
     _emit(f"converting {Path(hoot_path).name} (~1-2 min)")
     tmpdir = Path(tempfile.mkdtemp(prefix="vlogger_hoot_"))
@@ -273,46 +305,63 @@ def _convert_hoot(owlet, hoot_path):
             check=False,
         )
         outputs = sorted(tmpdir.glob("hoot*.wpilog"))
-
         if not outputs:
             stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
-            return [], False, f"owlet rc={proc.returncode}, no output. {stderr_tail[-1]}"
+            return None, False, f"owlet rc={proc.returncode}, no output. {stderr_tail[-1]}"
 
-        # Move owlet's outputs into the persistent cache.
-        cached = _persist_outputs(hoot_path, outputs)
+        # Stream every rollover through UNIVERSAL_HOOT_REGEX into a single dict.
+        # `load_into_raw` already filters out non-numeric / non-string payloads.
+        _emit(f"filtering {Path(hoot_path).name} ({len(outputs)} rollover{'s' if len(outputs) != 1 else ''})")
+        filtered: dict[str, list] = defaultdict(list)
+        for opath in outputs:
+            wpisrc = vlogger.get_source(f"wpilog:///{opath}", UNIVERSAL_HOOT_REGEX)
+            load_into_raw(filtered, wpisrc)
+        # Sort once at write time so loaders can skip re-sorting. Python's
+        # TimSort is O(n) on already-sorted data, which is the common case.
+        for name in filtered:
+            filtered[name].sort(key=lambda x: x[0])
+        filtered = dict(filtered)
+
+        _save_filtered_pkl(pkl, filtered)
+        # Reclaim disk: drop any pre-v1 wpilog cache files for this (stem, mtime).
+        try:
+            mtime_int = int(Path(hoot_path).stat().st_mtime)
+            _purge_legacy_wpilog_cache(_hoot_cache_dir(hoot_path),
+                                        Path(hoot_path).stem, mtime_int)
+        except OSError:
+            pass
 
         err = None
         if proc.returncode != 0:
             stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
             err = (f"owlet rc={proc.returncode}, using partial output "
-                   f"({len(cached)} file{'s' if len(cached) != 1 else ''}). "
+                   f"({len(outputs)} rollover{'s' if len(outputs) != 1 else ''}). "
                    f"{stderr_tail[-1]}")
-        return cached, False, err
+        return pkl, False, err
     finally:
-        # tmpdir might still hold copies if persist failed; clean up either way.
+        # tmpdir holds owlet's raw rollovers (multi-GB); always clean up.
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def attach_paired_hoots(raw, wpilog_path, hoot_regex, *, bus="canivore"):
-    """Best-effort: find paired hoots for `wpilog_path` and merge their data.
+    """Best-effort: find paired hoots, load filtered cache, merge what matches.
 
     Behaviour:
-      - Skipped entirely when the module-level `_skip` flag is True (set by the
-        GUI's "Skip hoot pairing" toggle).
+      - Skipped when the module-level `_skip` flag is True (sidebar toggle).
       - Skipped when input isn't a `.wpilog` (a `.hoot` was passed directly).
       - Skipped when owlet can't be found.
-      - Persistent cache: `<hoot_dir>/.vlogger_hoot_cache/<stem>.<mtime>.wpilog`
-        (+ rollovers). Cache hits skip owlet entirely. Source hoot replaced →
-        new mtime → fresh conversion.
-      - Tolerates non-zero owlet exits when partial output exists.
-      - Reads every rollover file owlet emits (1 GB cap → `hoot.2.wpilog`,
-        `hoot.3.wpilog`, ...).
+      - Persistent cache: `<hoot_dir>/.vlogger_hoot_cache/<stem>.<mtime>.vN.pkl`.
+        Pre-filtered through UNIVERSAL_HOOT_REGEX at conversion time so the
+        on-disk file is a few tens of MB, not the 1+ GB of raw owlet output.
+        Source hoot replaced → new mtime → fresh conversion. CAN-ID list
+        change → bumped HOOT_CACHE_VERSION → fresh conversion.
+      - The caller's `hoot_regex` is applied as a narrower second-pass filter
+        on the pkl contents, so each analysis still only merges its own CAN
+        IDs into `raw`.
 
     Returns the list of source hoot files that contributed data (possibly
     empty). Per-file failures are logged to stderr and skipped.
     """
-    import vlogger  # noqa: PLC0415 — lazy so this module is importable on its own
-
     if _skip:
         return []
     if not wpilog_path.lower().endswith(".wpilog"):
@@ -321,19 +370,25 @@ def attach_paired_hoots(raw, wpilog_path, hoot_regex, *, bus="canivore"):
     if not owlet:
         return []
 
+    pattern = re.compile(hoot_regex)
     used = []
     for hpath in find_paired_hoots(wpilog_path, bus=bus):
         try:
-            outputs, was_cached, err = _convert_hoot(owlet, hpath)
+            pkl, was_cached, err = _convert_hoot(owlet, hpath)
             if err:
                 sys.stderr.write(f"[hoot] {os.path.basename(hpath)}: {err}\n")
-            if not outputs:
+            if pkl is None:
                 continue
-            _emit(f"reading {len(outputs)} wpilog{'s' if len(outputs) != 1 else ''} "
-                  f"({'cached' if was_cached else 'fresh'})")
-            for opath in outputs:
-                wpisrc = vlogger.get_source(f"wpilog:///{opath}", hoot_regex)
-                load_into_raw(raw, wpisrc)
+            filtered = _load_filtered_pkl(pkl)
+            if filtered is None:
+                # Pkl write succeeded but read failed — corrupt cache?
+                sys.stderr.write(f"[hoot] {os.path.basename(hpath)}: cache "
+                                 f"unreadable; treating as miss\n")
+                continue
+            _emit(f"reading {Path(hpath).name} ({'cached' if was_cached else 'fresh'})")
+            for name, pts in filtered.items():
+                if pattern.search(name):
+                    raw[name].extend(pts)
             used.append(hpath)
         except Exception as e:                              # noqa: BLE001
             sys.stderr.write(f"[hoot] {os.path.basename(hpath)}: {e}\n")
@@ -391,3 +446,9 @@ def hoot_regex(can_ids, signals=DEFAULT_SIGNALS):
     ids = "|".join(str(c) for c in can_ids)
     sigs = "|".join(signals)
     return f"Phoenix6/TalonFX-(?:{ids})/(?:{sigs})"
+
+
+# Regex applied at cache time to narrow owlet's output down to just the
+# signals any analysis might consume. Placed after hoot_regex() so it can
+# call the helper directly.
+UNIVERSAL_HOOT_REGEX = hoot_regex(UNIVERSAL_CAN_IDS)
