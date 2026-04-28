@@ -1,0 +1,5 @@
+[client]
+# Hide the top-right "Deploy" button (and other developer toolbar actions).
+# The "Running.../Stop" indicator that appears while a script is executing
+# is a separate UI element and stays visible.
+toolbarMode = "viewer"
