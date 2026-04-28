@@ -275,14 +275,26 @@ def load_into_raw(raw, src):
 def _convert_hoot(owlet, hoot_path):
     """Convert hoot → universal-filtered pickle. Returns (pkl_path_or_None, was_cached, error).
 
-    Cache hits skip owlet entirely. On a miss owlet runs once into a temp dir,
-    we decode every rollover wpilog through UNIVERSAL_HOOT_REGEX into a single
-    `{signal_name: [(ts, val), ...]}` dict, pickle it, and discard the multi-GB
-    rollovers. The pkl typically lands at 10-50 MB (vs 1+ GB raw owlet output)
-    because we only keep DEFAULT_SIGNALS for CAN IDs the analyses actually read.
+    Cache hits skip owlet entirely. On a miss the conversion uses two
+    layered filters:
 
-    Tolerates non-zero owlet exit when partial output exists (truncated hoots
-    from mid-match disables still produce useful data).
+        1. owlet --scan → list signal IDs whose names match
+           _UNIVERSAL_SCAN_REGEX, then `owlet --signals <csv> ...` so
+           owlet writes a wpilog that already contains only what we
+           want. This avoids the multi-GB temp-disk + write cost of a
+           full conversion when scan succeeds.
+
+        2. After conversion, we still stream the rollovers through
+           UNIVERSAL_HOOT_REGEX (Python-side) before pickling. This is
+           the safety net: if scan parsing fails or we hit a future
+           owlet that changes its scan format, we fall back to
+           "convert everything, filter Python-side" without losing
+           data.
+
+    The pkl typically lands at 10-50 MB (vs 1+ GB raw owlet output)
+    regardless of which path we took. Tolerates non-zero owlet exit
+    when partial output exists (truncated hoots from mid-match
+    disables still produce useful data).
 
     `error` is None on success or a short string for the stderr log.
     """
@@ -293,12 +305,36 @@ def _convert_hoot(owlet, hoot_path):
         _emit(f"cached {Path(hoot_path).name}")
         return pkl, True, None
 
-    _emit(f"converting {Path(hoot_path).name} (~1-2 min)")
+    # Phase 1: scan the hoot for signal IDs we care about, so owlet can
+    # narrow the conversion. None = scan failed (fall back to full); [] =
+    # scan succeeded with zero matches (skip owlet entirely).
+    filter_ids = _scan_signal_ids(owlet, hoot_path)
+
+    if filter_ids == []:
+        _emit(f"no relevant signals in {Path(hoot_path).name} (scan)")
+        _save_filtered_pkl(pkl, {})
+        try:
+            mtime_int = int(Path(hoot_path).stat().st_mtime)
+            _purge_legacy_wpilog_cache(_hoot_cache_dir(hoot_path),
+                                        Path(hoot_path).stem, mtime_int)
+        except OSError:
+            pass
+        return pkl, False, None
+
+    if filter_ids:
+        _emit(f"converting {Path(hoot_path).name} "
+              f"({len(filter_ids)} signal{'s' if len(filter_ids) != 1 else ''})")
+    else:
+        _emit(f"converting {Path(hoot_path).name} (full, ~1-2 min)")
+
     tmpdir = Path(tempfile.mkdtemp(prefix="vlogger_hoot_"))
     try:
         out_base = tmpdir / "hoot.wpilog"
+        cmd = [owlet, str(hoot_path), str(out_base), "-f", "wpilog"]
+        if filter_ids:
+            cmd += ["--signals", ",".join(filter_ids)]
         proc = subprocess.run(
-            [owlet, str(hoot_path), str(out_base), "-f", "wpilog"],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -309,21 +345,20 @@ def _convert_hoot(owlet, hoot_path):
             stderr_tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
             return None, False, f"owlet rc={proc.returncode}, no output. {stderr_tail[-1]}"
 
-        # Stream every rollover through UNIVERSAL_HOOT_REGEX into a single dict.
-        # `load_into_raw` already filters out non-numeric / non-string payloads.
-        _emit(f"filtering {Path(hoot_path).name} ({len(outputs)} rollover{'s' if len(outputs) != 1 else ''})")
+        # Phase 2 safety filter — if scan-time worked it's already a near-
+        # subset, but the regex pass is cheap and protects us against any
+        # mismatch between scan IDs and converted names.
+        _emit(f"filtering {Path(hoot_path).name} "
+              f"({len(outputs)} rollover{'s' if len(outputs) != 1 else ''})")
         filtered: dict[str, list] = defaultdict(list)
         for opath in outputs:
             wpisrc = vlogger.get_source(f"wpilog:///{opath}", UNIVERSAL_HOOT_REGEX)
             load_into_raw(filtered, wpisrc)
-        # Sort once at write time so loaders can skip re-sorting. Python's
-        # TimSort is O(n) on already-sorted data, which is the common case.
         for name in filtered:
             filtered[name].sort(key=lambda x: x[0])
         filtered = dict(filtered)
 
         _save_filtered_pkl(pkl, filtered)
-        # Reclaim disk: drop any pre-v1 wpilog cache files for this (stem, mtime).
         try:
             mtime_int = int(Path(hoot_path).stat().st_mtime)
             _purge_legacy_wpilog_cache(_hoot_cache_dir(hoot_path),
@@ -339,7 +374,7 @@ def _convert_hoot(owlet, hoot_path):
                    f"{stderr_tail[-1]}")
         return pkl, False, err
     finally:
-        # tmpdir holds owlet's raw rollovers (multi-GB); always clean up.
+        # tmpdir holds owlet's output rollovers; always clean up.
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -452,3 +487,61 @@ def hoot_regex(can_ids, signals=DEFAULT_SIGNALS):
 # signals any analysis might consume. Placed after hoot_regex() so it can
 # call the helper directly.
 UNIVERSAL_HOOT_REGEX = hoot_regex(UNIVERSAL_CAN_IDS)
+
+# Same predicate, but matched against owlet `--scan` output names. Owlet's
+# scan reports unprefixed names (e.g. "TalonFX-1/DeviceTemp"); the prefix
+# "Phoenix6/" only appears once owlet writes the wpilog.
+_UNIVERSAL_SCAN_REGEX = UNIVERSAL_HOOT_REGEX.replace("Phoenix6/", "", 1)
+
+
+def _scan_signal_ids(owlet, hoot_path):
+    """Run `owlet --scan` and return the hex signal IDs whose names match
+    `_UNIVERSAL_SCAN_REGEX`.
+
+    Returns:
+        list[str]  — ordered hex IDs to pass to `owlet --signals`. Empty
+                     list means "scan worked but the hoot contains no
+                     signals any analysis cares about".
+        None       — scan failed or its output couldn't be parsed; the
+                     caller should fall back to unfiltered conversion.
+
+    Scan output format (one line per signal):
+        <signal_name>:<padding><hex_id>
+
+    e.g. ``TalonFX-1/DeviceTemp:                              2cd0100``.
+    Names may contain a colon (``DS:IsDSAttached``); the regex anchors on
+    the *trailing* `:<spaces><hex>` to disambiguate.
+    """
+    try:
+        proc = subprocess.run(
+            [owlet, "--scan", str(hoot_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+
+    line_re = re.compile(r"^(.+):\s+([0-9a-fA-F]+)$")
+    name_re = re.compile(_UNIVERSAL_SCAN_REGEX)
+    parsed_any = False
+    matched: list[str] = []
+    for line in proc.stdout.splitlines():
+        m = line_re.match(line)
+        if not m:
+            continue
+        parsed_any = True
+        name, sig_id = m.group(1), m.group(2)
+        if name_re.search(name):
+            matched.append(sig_id)
+
+    # If we couldn't parse a single line the format probably changed in
+    # a future owlet version — fall back to full conversion rather than
+    # silently dropping every signal.
+    if not parsed_any:
+        return None
+    return matched
