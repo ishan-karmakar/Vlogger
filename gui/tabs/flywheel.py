@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Flywheel analysis tab — per-match drill-down + season aggregate."""
 
+import os
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -8,6 +10,25 @@ import streamlit as st
 from analysis import flywheel_analysis
 from gui.components import per_match_picker, raw_report, empty_state
 from gui.data import capture_text, match_label
+
+
+def _hoot_motor_df(r: dict) -> pd.DataFrame:
+    rows = []
+    for m in r.get("hoot_motors", []):
+        s = m.get("stats") or {}
+        rows.append({
+            "Motor":         m["label"],
+            "CAN":           m["can_id"],
+            "°C pk":         s.get("peak_temp_c"),
+            "°C avg":        s.get("mean_temp_c"),
+            "I_sup pk (A)":  s.get("peak_supply_curr"),
+            "I_torq pk (A)": s.get("peak_torque_curr"),
+        })
+    df = pd.DataFrame(rows)
+    for col in df.columns:
+        if df[col].dtype == "float64":
+            df[col] = df[col].round(2)
+    return df
 
 
 def render_per_log(r: dict) -> None:
@@ -23,7 +44,25 @@ def render_per_log(r: dict) -> None:
     c5.metric("Shoot cycles", f"{len(r['cycles'])}")
     c6.metric("Mean stator I (sum)", f"{r['mean_I_tot']:.1f} A")
     c7.metric("Peak stator I (sum)", f"{r['peak_I_tot']:.1f} A")
-    c8.metric("Cruise samples", f"{r.get('cruise_n', 0)}")
+    if r.get("max_motor_temp_c") is not None:
+        c8.metric("Peak motor temp",
+                  f"{r['max_motor_temp_c']:.1f} °C",
+                  "any of 3 motors (hoot)")
+    else:
+        c8.metric("Cruise samples", f"{r.get('cruise_n', 0)}")
+
+    if r.get("hoot_files_used"):
+        st.caption(
+            "Paired hoot: "
+            + ", ".join(os.path.basename(p) for p in r["hoot_files_used"])
+        )
+
+    if any(m.get("stats") for m in r.get("hoot_motors", [])):
+        st.markdown(
+            "**Per-motor telemetry** (from paired hoot — DeviceTemp, "
+            "SupplyCurrent, TorqueCurrent)"
+        )
+        st.dataframe(_hoot_motor_df(r), hide_index=True, width="content")
 
     cycles = r["cycles"]
     if cycles:

@@ -34,6 +34,8 @@ import time
 import datetime
 import contextlib
 import concurrent.futures
+import shutil
+from pathlib import Path
 import numpy as np
 from collections import defaultdict
 
@@ -79,6 +81,18 @@ F_STATE         = "NT:/SmartDashboard/Shooter/Flywheel State"
 F_FEEDER_L      = "NT:/SmartDashboard/Intake/Left Feeder Motor/Speed"
 F_FEEDER_R      = "NT:/SmartDashboard/Intake/Right Feeder Motor/Speed"
 
+# Hoot CAN-ID mapping for the 3 flywheel motors. Phoenix6 logs label devices as
+# `Phoenix6/TalonFX-<id>/...`. Edit if your wiring changes.
+CAN_FLYWHEEL = (
+    ("Left",      30),
+    ("Right One", 31),
+    ("Right Two", 32),
+)
+HOOT_DRIVETRAIN_SIGNALS = ("DeviceTemp", "SupplyCurrent", "TorqueCurrent")
+HOOT_REGEX = (
+    r"Phoenix6/TalonFX-(?:30|31|32)/(?:" + "|".join(HOOT_DRIVETRAIN_SIGNALS) + r")"
+)
+
 AT_SPEED_FRACTION = 0.90
 CRUISE_TOLERANCE  = 0.5
 FEEDER_IDLE_RPS   = 1.0
@@ -90,10 +104,47 @@ SEP = "-" * 72
 
 # -- Data loading ----------------------------------------------------------------
 
-def load_series(log_path):
-    raw = defaultdict(list)
-    url = f"wpilog:///{log_path}" if not log_path.startswith("wpilog:") else log_path
-    src = vlogger.get_source(url, FLYWHEEL_REGEX)
+def _find_owlet():
+    """Locate CTRE's owlet — first PATH, then `<repo_root>/tools/`. None if missing."""
+    p = shutil.which("owlet")
+    if p:
+        return p
+    repo_root = Path(__file__).resolve().parent.parent
+    tools_dir = repo_root / "tools"
+    if tools_dir.is_dir():
+        for f in sorted(tools_dir.iterdir()):
+            if f.is_file() and f.name.lower().startswith("owlet"):
+                return str(f)
+    return None
+
+
+def _find_paired_hoots(wpilog_path):
+    """Return canivore-bus *.hoot files near a .wpilog (flywheel motors live there).
+
+    Heuristic: walk the wpilog's parent dir + 1-level subdirs; skip files with
+    `_rio_` in name (rio bus doesn't have the flywheel motors).
+    """
+    p = Path(wpilog_path)
+    if not p.exists():
+        return []
+    search_dirs = {p.parent}
+    try:
+        for d in p.parent.iterdir():
+            if d.is_dir():
+                search_dirs.add(d)
+    except OSError:
+        pass
+    hoots = []
+    for d in search_dirs:
+        for f in d.glob("*.hoot"):
+            if "_rio_" in f.name.lower():
+                continue
+            hoots.append(str(f))
+    return sorted(set(hoots))
+
+
+def _load_into_raw(raw, src):
+    """Iterate a vlogger source and append entries into the shared raw dict."""
     with src:
         for entry in src:
             name = entry["name"]
@@ -105,9 +156,57 @@ def load_series(log_path):
                 raw[name].append((ts, float(val)))
             elif isinstance(val, str):
                 raw[name].append((ts, val))
+
+
+def load_series(log_path):
+    """Load WPI series + (optionally) any paired-hoot motor signals.
+
+    Returns (series_dict, hoot_files_used). Hoot pairing is best-effort — if
+    owlet is missing or no paired files exist, hoot_files_used is empty and
+    only the WPI fields are populated.
+    """
+    raw = defaultdict(list)
+
+    url = f"wpilog:///{log_path}" if not log_path.startswith("wpilog:") else log_path
+    src = vlogger.get_source(url, FLYWHEEL_REGEX)
+    _load_into_raw(raw, src)
+
+    hoot_files_used = []
+    if log_path.lower().endswith(".wpilog"):
+        owlet = _find_owlet()
+        if owlet:
+            for hpath in _find_paired_hoots(log_path):
+                try:
+                    hsrc = vlogger.get_source(f"hoot:///{hpath}", HOOT_REGEX, owlet=owlet)
+                    _load_into_raw(raw, hsrc)
+                    hoot_files_used.append(hpath)
+                except Exception as e:                          # noqa: BLE001
+                    sys.stderr.write(f"[hoot] couldn't open {hpath}: {e}\n")
+
     for name in raw:
         raw[name].sort(key=lambda x: x[0])
-    return dict(raw)
+    return dict(raw), hoot_files_used
+
+
+def _hoot_motor_stats(series, canid):
+    """Per-TalonFX peak/mean stats from the paired hoot. None if no hoot data.
+
+    No interpolation: peaks/means are computed on the hoot's native timestamps,
+    which preserves the high sample rate.
+    """
+    prefix = f"Phoenix6/TalonFX-{canid}"
+    _, temp = to_np(series, f"{prefix}/DeviceTemp")
+    _, supc = to_np(series, f"{prefix}/SupplyCurrent")
+    _, tqc  = to_np(series, f"{prefix}/TorqueCurrent")
+    if temp is None and supc is None and tqc is None:
+        return None
+    return {
+        "peak_temp_c":      float(np.max(temp))         if temp is not None else None,
+        "mean_temp_c":      float(np.mean(temp))        if temp is not None else None,
+        "peak_supply_curr": float(np.max(np.abs(supc))) if supc is not None else None,
+        "mean_supply_curr": float(np.mean(np.abs(supc))) if supc is not None else None,
+        "peak_torque_curr": float(np.max(np.abs(tqc)))  if tqc  is not None else None,
+    }
 
 # -- Helpers ---------------------------------------------------------------------
 
@@ -270,7 +369,7 @@ def spinup_end_time(ts_speed, speed, t_start, t_end, req_speed):
 
 def analyze_log(log_path):
     """Run the per-log analysis and return a result dict. Prints a compact summary."""
-    series = load_series(log_path)
+    series, hoot_files_used = load_series(log_path)
 
     ts_ls,  left_speed   = to_np(series, F_LEFT_SPEED)
     ts_lc,  left_current = to_np(series, F_LEFT_CURRENT)
@@ -363,6 +462,15 @@ def analyze_log(log_path):
     # Build the result dict containing ONLY the small numpy arrays / scalars we
     # need downstream. Done before we drop the big intermediates so any view
     # references get materialized via .copy().
+    # Hoot per-motor telemetry. Each entry is None when no hoot data was paired.
+    hoot_motors = [
+        {"label": label, "can_id": cid, "stats": _hoot_motor_stats(series, cid)}
+        for (label, cid) in CAN_FLYWHEEL
+    ]
+    hoot_temps = [m["stats"]["peak_temp_c"] for m in hoot_motors
+                  if m["stats"] and m["stats"].get("peak_temp_c") is not None]
+    max_motor_temp_c = max(hoot_temps) if hoot_temps else None
+
     result = {
         "log_path":       log_path,
         "session_len":    float(ts_grid[-1] - ts_grid[0]),
@@ -381,6 +489,9 @@ def analyze_log(log_path):
         "peak_I_R2":      float(np.max(np.abs(r2c_g))),
         "mean_I_tot":     float(np.mean(current_total)),
         "peak_I_tot":     float(np.max(current_total)),
+        "hoot_motors":      hoot_motors,
+        "hoot_files_used":  hoot_files_used,
+        "max_motor_temp_c": max_motor_temp_c,
     }
 
     # Drop the heavy local references so the worker's RSS shrinks before the
@@ -416,6 +527,13 @@ def print_per_log_report(r):
     print(f"  Shoot cycles         : {len(r['cycles'])}  "
           f"(SCORING={n_score}, SHUTTLING={n_shutl}"
           + (f", other={n_other}" if n_other else "") + ")")
+    if r.get("max_motor_temp_c") is not None:
+        print(f"  Peak motor temp      : {r['max_motor_temp_c']:.1f} °C  "
+              f"(across all 3 flywheel motors, from hoot)")
+    if r.get("hoot_files_used"):
+        print(f"  Hoot data merged from: {len(r['hoot_files_used'])} file(s)")
+        for hp in r["hoot_files_used"]:
+            print(f"      - {os.path.basename(hp)}")
 
     # Per-log alignment and X-mode aggregates
     scoring = [c for c in r["cycles"] if c["aim_mode"] == "SCORING"]
@@ -441,6 +559,25 @@ def print_per_log_report(r):
     print(f"  {'Right 1 motor (stator)':35s}  {r['mean_I_R1']:>9.1f}  {r['peak_I_R1']:>9.1f}")
     print(f"  {'Right 2 motor (stator)':35s}  {r['mean_I_R2']:>9.1f}  {r['peak_I_R2']:>9.1f}")
     print(f"  {'Combined (all 3)':35s}  {r['mean_I_tot']:>9.1f}  {r['peak_I_tot']:>9.1f}")
+
+    # Hoot-derived per-motor telemetry (only when present)
+    if any(m["stats"] for m in r.get("hoot_motors", [])):
+        print()
+        print(f"  Per-motor telemetry (from hoot):")
+        print(f"  {'Motor':<14}  {'CAN':>3}  {'°C pk':>6}  {'°C avg':>7}  "
+              f"{'I_sup pk':>9}  {'I_torq pk':>10}")
+        print(f"  {'-'*14}  {'-'*3}  {'-'*6}  {'-'*7}  "
+              f"{'-'*9}  {'-'*10}")
+        def _f(d, k, fmt):
+            v = d.get(k) if d else None
+            return fmt.format(v) if v is not None else "  -- "
+        for m in r["hoot_motors"]:
+            s = m["stats"]
+            print(f"  {m['label']:<14}  {m['can_id']:>3}  "
+                  f"{_f(s, 'peak_temp_c',      '{:>4.1f}°'):>6}  "
+                  f"{_f(s, 'mean_temp_c',      '{:>5.1f}°'):>7}  "
+                  f"{_f(s, 'peak_supply_curr', '{:>7.1f}A'):>9}  "
+                  f"{_f(s, 'peak_torque_curr', '{:>8.1f}A'):>10}")
 
     cycles = r["cycles"]
     if not cycles:

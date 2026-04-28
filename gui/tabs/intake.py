@@ -12,6 +12,25 @@ from gui.components import per_match_picker, raw_report, empty_state
 from gui.data import capture_text, match_label
 
 
+def _hoot_motor_df(r: dict) -> pd.DataFrame:
+    rows = []
+    for m in r.get("hoot_motors", []):
+        s = m.get("stats") or {}
+        rows.append({
+            "Motor":         m["label"],
+            "CAN":           m["can_id"],
+            "°C pk":         s.get("peak_temp_c"),
+            "°C avg":        s.get("mean_temp_c"),
+            "I_sup pk (A)":  s.get("peak_supply_curr"),
+            "I_torq pk (A)": s.get("peak_torque_curr"),
+        })
+    df = pd.DataFrame(rows)
+    for col in df.columns:
+        if df[col].dtype == "float64":
+            df[col] = df[col].round(2)
+    return df
+
+
 def render_per_log(r: dict) -> None:
     st.subheader(match_label(r["log_path"]))
 
@@ -21,10 +40,28 @@ def render_per_log(r: dict) -> None:
     c3.metric("INTAKING cycles", f"{r['n_intaking']}")
     c4.metric("Jam events", f"{r['total_jams']}")
 
-    c5, c6, c7 = st.columns(3)
+    c5, c6, c7, c8 = st.columns(4)
     c5.metric("Peak speed L", f"{r['max_speed_L']:.1f} RPS")
     c6.metric("Peak speed R", f"{r['max_speed_R']:.1f} RPS")
     c7.metric("SHOOTING cycles", f"{r['n_shooting']}")
+    if r.get("max_motor_temp_c") is not None:
+        c8.metric("Peak motor temp", f"{r['max_motor_temp_c']:.1f} °C",
+                  "either motor (hoot)")
+    else:
+        c8.empty()
+
+    if r.get("hoot_files_used"):
+        st.caption(
+            "Paired hoot: "
+            + ", ".join(os.path.basename(p) for p in r["hoot_files_used"])
+        )
+
+    if any(m.get("stats") for m in r.get("hoot_motors", [])):
+        st.markdown(
+            "**Per-motor telemetry** (from paired rio-bus hoot — DeviceTemp, "
+            "SupplyCurrent, TorqueCurrent)"
+        )
+        st.dataframe(_hoot_motor_df(r), hide_index=True, width="content")
 
     # State time distribution
     st.markdown("**Time in each Intake State**")

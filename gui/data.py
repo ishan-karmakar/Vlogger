@@ -52,7 +52,10 @@ ANALYSES = {
 # v3: drivetrain phase 2 — paired-hoot motor telemetry (DeviceTemp,
 #     SupplyCurrent, TorqueCurrent) added under modules[*].drive.hoot /
 #     azimuth.hoot, plus chassis.max_motor_temp_c and hoot_files_used.
-CACHE_VERSION = 3
+# v4: same hoot pairing extended to flywheel (CAN 30/31/32 on canivore) and
+#     intake (CAN 12/13 on rio). Result dicts gain hoot_motors list,
+#     hoot_files_used, max_motor_temp_c.
+CACHE_VERSION = 4
 CACHE_DIR_NAME = ".vlogger_cache"
 
 
