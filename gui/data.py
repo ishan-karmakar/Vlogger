@@ -49,7 +49,10 @@ ANALYSES = {
 # feed stale dicts into the renderers.
 # v2: added drivetrain analysis (new kind; doesn't invalidate other kinds, but
 #     bumping is the simplest way to keep version monotonic).
-CACHE_VERSION = 2
+# v3: drivetrain phase 2 — paired-hoot motor telemetry (DeviceTemp,
+#     SupplyCurrent, TorqueCurrent) added under modules[*].drive.hoot /
+#     azimuth.hoot, plus chassis.max_motor_temp_c and hoot_files_used.
+CACHE_VERSION = 3
 CACHE_DIR_NAME = ".vlogger_cache"
 
 

@@ -5,16 +5,26 @@ Drivetrain energy & performance analysis for FRC Team Valor 6800.
 Per-module: Drive Motor (CAN IDs 1-4) + Azimuth Motor (CAN IDs 5-8) for
 the 4 swerve modules (indexed 0-3 in the WPILog under SmartDashboard/SwerveDrive).
 
-Power model    : |Out Volt| * |Stator Current| per motor, per axis
+Inputs:
+- WPILog (required): NetworkTables fields under SmartDashboard/SwerveDrive/* —
+  per-module Drive/Azimuth Motor signals, gyro, driver state strings.
+- *.hoot file paired in the wpilog's directory tree (optional, canivore bus
+  only — files with `_rio_` in the name are skipped). Provides higher-fidelity
+  Phoenix6/TalonFX-1..8 telemetry: DeviceTemp, SupplyCurrent, TorqueCurrent.
+  Hoot reading needs CTRE's `owlet` — auto-detected on PATH or in `tools/`
+  next to the repo root. If owlet is missing, hoot fields come back None and
+  the WPI-only analysis still runs.
+
+Power model    : |Out Volt| * |Stator Current| per motor, per axis (WPI)
 Energy         : trapezoidal integration of instantaneous power over time
 Tracking error : drive   = |reqSpeed - actual| (RPS)
                  azimuth = wrapped angular distance from reqPosition (deg)
 Cycles         : ALIGN_TO_TARGET  windows from Driver Rotation State
                  X_MODE           windows from Driver Translation State
 
-Hoot inputs are accepted on the CLI (url scheme switches automatically) but the
-required `Driver Rotation State`, `Gyro Yaw`, etc. live in NetworkTables and so
-only appear in WPILogs — hoot-only inputs return None.
+Hoot inputs alone (.hoot CLI arg) are accepted but the required Driver
+Rotation State / Gyro Yaw / etc. only live in WPILogs — pass the wpilog and
+the matching hoot is auto-paired.
 
 Usage:
     python drivetrain_analysis.py                       # default log
@@ -31,6 +41,8 @@ import time
 import datetime
 import contextlib
 import concurrent.futures
+import shutil
+from pathlib import Path
 import numpy as np
 from collections import defaultdict, Counter
 
@@ -46,6 +58,25 @@ DEFAULT_LOG = os.path.abspath(os.path.join(
 
 NUM_MODULES = 4
 MODULE_LABELS = {0: "Module 0", 1: "Module 1", 2: "Module 2", 3: "Module 3"}
+
+# Hoot CAN-ID mapping. Phoenix6 logs label devices as `Phoenix6/TalonFX-<id>/...`
+# Layout for Valor's Downpour chassis (interleaved azim/drive per module):
+#   module 0: azim=1, drive=2  | module 1: azim=3, drive=4
+#   module 2: azim=5, drive=6  | module 3: azim=7, drive=8
+# CANcoders 20..23 (one per module, in module order) and Pigeon-61 are on the
+# same bus but aren't used by this analysis yet.
+CAN_AZIMUTH_BY_MODULE = (1, 3, 5, 7)
+CAN_DRIVE_BY_MODULE   = (2, 4, 6, 8)
+CAN_CANCODER_BY_MODULE = (20, 21, 22, 23)
+CAN_PIGEON             = 61
+
+# Signals we want from each TalonFX in the paired hoot. Cheap subset of the
+# ~112 signals per device; extending costs little since the regex filters at
+# the source level.
+HOOT_DRIVETRAIN_SIGNALS = ("DeviceTemp", "SupplyCurrent", "TorqueCurrent")
+HOOT_REGEX = (
+    r"Phoenix6/TalonFX-(?:[1-8])/(?:" + "|".join(HOOT_DRIVETRAIN_SIGNALS) + r")"
+)
 
 DRIVETRAIN_REGEX = (
     r"NT:/SmartDashboard/SwerveDrive/("
@@ -94,9 +125,48 @@ def _make_url(log_path):
     return f"wpilog:///{log_path}"
 
 
-def load_series(log_path):
-    raw = defaultdict(list)
-    src = vlogger.get_source(_make_url(log_path), DRIVETRAIN_REGEX)
+def _find_owlet():
+    """Locate CTRE's owlet — first PATH, then `<repo_root>/tools/`. None if missing."""
+    p = shutil.which("owlet")
+    if p:
+        return p
+    repo_root = Path(__file__).resolve().parent.parent
+    tools_dir = repo_root / "tools"
+    if tools_dir.is_dir():
+        for f in sorted(tools_dir.iterdir()):
+            if f.is_file() and f.name.lower().startswith("owlet"):
+                return str(f)
+    return None
+
+
+def _find_paired_hoots(wpilog_path):
+    """Return canivore-bus *.hoot files near a .wpilog (likely contain TalonFX-1..8).
+
+    Heuristic: walk the wpilog's parent dir + 1-level subdirs; skip files with
+    `_rio_` in name (rio-bus hoots don't have the swerve drivetrain). Sorting
+    keeps the pairing deterministic across runs.
+    """
+    p = Path(wpilog_path)
+    if not p.exists():
+        return []
+    search_dirs = {p.parent}
+    try:
+        for d in p.parent.iterdir():
+            if d.is_dir():
+                search_dirs.add(d)
+    except OSError:
+        pass
+    hoots = []
+    for d in search_dirs:
+        for f in d.glob("*.hoot"):
+            if "_rio_" in f.name.lower():
+                continue
+            hoots.append(str(f))
+    return sorted(set(hoots))
+
+
+def _load_into_raw(raw, src):
+    """Iterate a vlogger source and append entries into the shared raw dict."""
     with src:
         for entry in src:
             name = entry["name"]
@@ -108,9 +178,37 @@ def load_series(log_path):
                 raw[name].append((ts, float(val)))
             elif isinstance(val, str):
                 raw[name].append((ts, val))
+
+
+def load_series(log_path):
+    """Load WPI series + (optionally) any paired-hoot drivetrain signals.
+
+    Returns (series_dict, hoot_files_used). Hoot pairing is best-effort — if
+    owlet is missing or no paired files exist, hoot_files_used is empty and
+    only the WPI fields are populated.
+    """
+    raw = defaultdict(list)
+
+    src = vlogger.get_source(_make_url(log_path), DRIVETRAIN_REGEX)
+    _load_into_raw(raw, src)
+
+    hoot_files_used = []
+    # Only pair hoots when the primary input is a wpilog — passing a .hoot
+    # alone means the user explicitly opted in to that single source.
+    if log_path.lower().endswith(".wpilog"):
+        owlet = _find_owlet()
+        if owlet:
+            for hpath in _find_paired_hoots(log_path):
+                try:
+                    hsrc = vlogger.get_source(f"hoot:///{hpath}", HOOT_REGEX, owlet=owlet)
+                    _load_into_raw(raw, hsrc)
+                    hoot_files_used.append(hpath)
+                except Exception as e:                          # noqa: BLE001
+                    sys.stderr.write(f"[hoot] couldn't open {hpath}: {e}\n")
+
     for name in raw:
         raw[name].sort(key=lambda x: x[0])
-    return dict(raw)
+    return dict(raw), hoot_files_used
 
 
 # -- Helpers ---------------------------------------------------------------------
@@ -204,6 +302,27 @@ def integrate_bool(ts_grid, mask):
 
 # -- Per-log analysis ------------------------------------------------------------
 
+def _hoot_motor_stats(series, canid):
+    """Per-TalonFX peak/mean stats from the paired hoot. None if no hoot data.
+
+    No interpolation: peaks/means are computed on the hoot's native timestamps,
+    which preserves the high sample rate.
+    """
+    prefix = f"Phoenix6/TalonFX-{canid}"
+    _, temp = to_np(series, f"{prefix}/DeviceTemp")
+    _, supc = to_np(series, f"{prefix}/SupplyCurrent")
+    _, tqc  = to_np(series, f"{prefix}/TorqueCurrent")
+    if temp is None and supc is None and tqc is None:
+        return None
+    return {
+        "peak_temp_c":      float(np.max(temp))       if temp is not None else None,
+        "mean_temp_c":      float(np.mean(temp))      if temp is not None else None,
+        "peak_supply_curr": float(np.max(np.abs(supc))) if supc is not None else None,
+        "mean_supply_curr": float(np.mean(np.abs(supc))) if supc is not None else None,
+        "peak_torque_curr": float(np.max(np.abs(tqc)))  if tqc  is not None else None,
+    }
+
+
 def _module_block(i, ts_grid, series):
     """Build the per-module result block. Returns dict + (drive_power_grid, azim_power_grid)."""
     ts_ds, drive_speed   = to_np(series, _drive(i, "Speed"))
@@ -260,6 +379,8 @@ def _module_block(i, ts_grid, series):
     return {
         "idx":               i,
         "label":             MODULE_LABELS[i],
+        "drive_can_id":      CAN_DRIVE_BY_MODULE[i],
+        "azimuth_can_id":    CAN_AZIMUTH_BY_MODULE[i],
         "drive": {
             "peak_speed":         float(np.max(np.abs(ds))),
             "mean_abs_current":   float(np.mean(np.abs(di))),
@@ -269,6 +390,7 @@ def _module_block(i, ts_grid, series):
             "pos_span":           drive_pos_range,
             "tracking_err_avg":   drive_err_avg,
             "tracking_err_pk":    drive_err_pk,
+            "hoot":               _hoot_motor_stats(series, CAN_DRIVE_BY_MODULE[i]),
         },
         "azimuth": {
             "mean_abs_current":   float(np.mean(np.abs(azi))),
@@ -276,13 +398,14 @@ def _module_block(i, ts_grid, series):
             "energy_J":           azim_E_J,
             "tracking_err_deg_avg": azim_err_avg,
             "tracking_err_deg_pk":  azim_err_pk,
+            "hoot":               _hoot_motor_stats(series, CAN_AZIMUTH_BY_MODULE[i]),
         },
     }, drive_power, azim_power
 
 
 def analyze_log(log_path):
     """Run per-log drivetrain analysis. Returns dict, or None if required signals missing."""
-    series = load_series(log_path)
+    series, hoot_files_used = load_series(log_path)
 
     rot_pts   = series.get(ROT_STATE,    [])
     trans_pts = series.get(TRANS_STATE,  [])
@@ -383,6 +506,23 @@ def analyze_log(log_path):
     auto_s    = integrate_bool(ts_grid, en_g & au_g)
     teleop_s  = max(0.0, enabled_s - auto_s)
 
+    # Chassis-wide hoot rollup: peak temperature across all 8 motors, and the
+    # peak sum of supply currents (worst-case battery draw if all spike together).
+    all_temps = []
+    sum_supply_pk = 0.0
+    for m in modules:
+        for axis in ("drive", "azimuth"):
+            h = m[axis].get("hoot")
+            if not h:
+                continue
+            if h.get("peak_temp_c") is not None:
+                all_temps.append(h["peak_temp_c"])
+            if h.get("peak_supply_curr") is not None:
+                sum_supply_pk += h["peak_supply_curr"]
+    max_motor_temp_c = max(all_temps) if all_temps else None
+    # sum_supply_pk is conservative (sum of per-motor peaks, not peak of sum) —
+    # the true peak-of-sum needs joint timestamps; leave that for a future pass.
+
     return {
         "log_path":      log_path,
         "session_len":   session_len,
@@ -398,7 +538,10 @@ def analyze_log(log_path):
             "mean_abs_yaw_rate":      mean_abs_yaw_rate,
             "net_yaw_deg":            net_yaw_deg,
             "total_yaw_revs":         total_yaw_revs,
+            "max_motor_temp_c":       max_motor_temp_c,
+            "sum_motor_supply_pk":    sum_supply_pk if sum_supply_pk > 0 else None,
         },
+        "hoot_files_used":        hoot_files_used,
         "rotation_state_time":    dict(rot_time),
         "translation_state_time": dict(trans_time),
         "align_cycles":           align_cycles,
@@ -425,6 +568,16 @@ def print_per_log_report(r):
     print(f"  Peak yaw rate           : {r['chassis']['peak_yaw_rate_deg_s']:.0f} deg/s")
     print(f"  Net heading change      : {r['chassis']['net_yaw_deg']:>+.1f} deg "
           f"({r['chassis']['total_yaw_revs']:.2f} full revolutions)")
+    if r["chassis"].get("max_motor_temp_c") is not None:
+        print(f"  Peak motor temp         : {r['chassis']['max_motor_temp_c']:.1f} °C  "
+              f"(across all 8 drivetrain motors)")
+    if r["chassis"].get("sum_motor_supply_pk") is not None:
+        print(f"  Sum of peak supply Is   : {r['chassis']['sum_motor_supply_pk']:.1f} A  "
+              f"(conservative worst-case battery draw)")
+    if r.get("hoot_files_used"):
+        print(f"  Hoot data merged from   : {len(r['hoot_files_used'])} file(s)")
+        for hp in r["hoot_files_used"]:
+            print(f"      - {os.path.basename(hp)}")
 
     # -- Per-module table
     print()
@@ -448,6 +601,29 @@ def print_per_log_report(r):
               f"{a['mean_abs_current']:>7.1f}A  {a['peak_current']:>7.1f}A  "
               f"{a['energy_J']/1000:>6.2f}k  "
               f"{a['tracking_err_deg_avg']:>9.1f}d  {a['tracking_err_deg_pk']:>8.1f}d")
+
+    # -- Hoot-derived per-motor telemetry (only printed if any module has it)
+    if any(m["drive"].get("hoot") or m["azimuth"].get("hoot") for m in r["modules"]):
+        print()
+        print(f"  Per-motor telemetry (from hoot):")
+        print()
+        print(f"  {'#':>2}  {'Drv °C pk':>9}  {'Drv °C avg':>10}  {'Drv I_sup pk':>13}  {'Drv I_torq pk':>14}  "
+              f"{'Azm °C pk':>9}  {'Azm I_sup pk':>13}")
+        print(f"  {'-'*2}  {'-'*9}  {'-'*10}  {'-'*13}  {'-'*14}  "
+              f"{'-'*9}  {'-'*13}")
+        for m in r["modules"]:
+            dh = m["drive"].get("hoot")  or {}
+            ah = m["azimuth"].get("hoot") or {}
+            def _f(d, k, fmt):
+                v = d.get(k)
+                return fmt.format(v) if v is not None else "  --   "
+            print(f"  {m['idx']:>2}  "
+                  f"{_f(dh, 'peak_temp_c',      '{:>7.1f}°'):>9}  "
+                  f"{_f(dh, 'mean_temp_c',      '{:>8.1f}°'):>10}  "
+                  f"{_f(dh, 'peak_supply_curr', '{:>11.1f}A'):>13}  "
+                  f"{_f(dh, 'peak_torque_curr', '{:>12.1f}A'):>14}  "
+                  f"{_f(ah, 'peak_temp_c',      '{:>7.1f}°'):>9}  "
+                  f"{_f(ah, 'peak_supply_curr', '{:>11.1f}A'):>13}")
 
     # -- Drive energy balance: are all 4 modules pulling roughly the same?
     drive_E = np.array([m["drive"]["energy_J"] for m in r["modules"]])
@@ -579,6 +755,43 @@ def print_combined_analysis(results):
     print(f"    Azim energy/match    : {(total_azim_E  / n_matches)/1000:.2f} kJ")
     print(f"    Aligns/match         : {total_aligns / n_matches:.1f}")
     print(f"    X_MODE/match         : {total_xmode  / n_matches:.1f}")
+
+    # -- Hoot rollup (only when at least one match included a paired hoot)
+    matches_with_hoot = [r for r in results if r.get("hoot_files_used")]
+    if matches_with_hoot:
+        # Per-CAN-ID peak temperature + supply current across season.
+        per_id_peak_temp = {cid: -float("inf") for cid in (*CAN_DRIVE_BY_MODULE, *CAN_AZIMUTH_BY_MODULE)}
+        per_id_peak_supc = {cid: 0.0           for cid in per_id_peak_temp}
+        global_peak_temp = -float("inf")
+        for r in matches_with_hoot:
+            for m in r["modules"]:
+                for axis_key, cid in (("drive",   m["drive_can_id"]),
+                                      ("azimuth", m["azimuth_can_id"])):
+                    h = m[axis_key].get("hoot")
+                    if not h:
+                        continue
+                    t = h.get("peak_temp_c")
+                    if t is not None:
+                        per_id_peak_temp[cid] = max(per_id_peak_temp[cid], t)
+                        global_peak_temp     = max(global_peak_temp, t)
+                    c = h.get("peak_supply_curr")
+                    if c is not None:
+                        per_id_peak_supc[cid] = max(per_id_peak_supc[cid], c)
+
+        print()
+        print(f"  Hoot motor telemetry  (paired hoot data on {len(matches_with_hoot)} / "
+              f"{n_matches} match{'es' if n_matches != 1 else ''}):")
+        print(f"    Season peak temp    : {global_peak_temp:.1f} °C  (any motor)")
+        print(f"    Per-motor peaks (°C / A_supply):")
+        for cid in (*CAN_DRIVE_BY_MODULE, *CAN_AZIMUTH_BY_MODULE):
+            label = ("DRV" if cid in CAN_DRIVE_BY_MODULE else "AZM")
+            mod_idx = (CAN_DRIVE_BY_MODULE.index(cid) if cid in CAN_DRIVE_BY_MODULE
+                       else CAN_AZIMUTH_BY_MODULE.index(cid))
+            t = per_id_peak_temp[cid]
+            c = per_id_peak_supc[cid]
+            t_str = f"{t:>6.1f}°C" if t != -float("inf") else "  --   "
+            c_str = f"{c:>6.1f} A" if c > 0 else "  --   "
+            print(f"      TalonFX-{cid:<2} (M{mod_idx} {label}): {t_str}  {c_str}")
 
     # -- Aggregate per-module energy share (across all matches)
     mod_drive_E = np.zeros(NUM_MODULES)

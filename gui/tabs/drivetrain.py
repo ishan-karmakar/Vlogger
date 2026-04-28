@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Drivetrain analysis tab — per-match drill-down + season aggregate."""
 
+import os
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -9,9 +11,39 @@ import streamlit as st
 from analysis import drivetrain_analysis
 from analysis.drivetrain_analysis import (
     NUM_MODULES, ROT_STATES, TRANS_STATES, ALIGN_TOL_RAD,
+    CAN_DRIVE_BY_MODULE, CAN_AZIMUTH_BY_MODULE,
 )
 from gui.components import per_match_picker, raw_report, empty_state
 from gui.data import capture_text, match_label
+
+
+def _has_hoot(r: dict) -> bool:
+    return any(m["drive"].get("hoot") or m["azimuth"].get("hoot") for m in r["modules"])
+
+
+def _hoot_motor_df(r: dict) -> pd.DataFrame:
+    rows = []
+    for m in r["modules"]:
+        dh = m["drive"].get("hoot")   or {}
+        ah = m["azimuth"].get("hoot") or {}
+        rows.append({
+            "Module":          f"M{m['idx']}",
+            "Drv CAN":         m["drive_can_id"],
+            "Drv °C pk":       dh.get("peak_temp_c"),
+            "Drv °C avg":      dh.get("mean_temp_c"),
+            "Drv I_sup pk":    dh.get("peak_supply_curr"),
+            "Drv I_torq pk":   dh.get("peak_torque_curr"),
+            "Azm CAN":         m["azimuth_can_id"],
+            "Azm °C pk":       ah.get("peak_temp_c"),
+            "Azm °C avg":      ah.get("mean_temp_c"),
+            "Azm I_sup pk":    ah.get("peak_supply_curr"),
+            "Azm I_torq pk":   ah.get("peak_torque_curr"),
+        })
+    df = pd.DataFrame(rows)
+    for col in df.columns:
+        if df[col].dtype == "float64":
+            df[col] = df[col].round(2)
+    return df
 
 
 def _module_summary_df(modules: list[dict]) -> pd.DataFrame:
@@ -60,11 +92,30 @@ def render_per_log(r: dict) -> None:
     c6.metric("Peak yaw rate", f"{r['chassis']['peak_yaw_rate_deg_s']:.0f} °/s")
     c7.metric("Net heading",   f"{r['chassis']['net_yaw_deg']:+.0f}°",
               f"{r['chassis']['total_yaw_revs']:.2f} revolutions")
-    c8.metric("Align cycles",  f"{len(r['align_cycles'])}")
+    if r["chassis"].get("max_motor_temp_c") is not None:
+        c8.metric("Peak motor temp",
+                  f"{r['chassis']['max_motor_temp_c']:.1f} °C",
+                  "any of 8 motors (hoot)")
+    else:
+        c8.metric("Align cycles",  f"{len(r['align_cycles'])}")
+
+    if r.get("hoot_files_used"):
+        st.caption(
+            "Paired hoot: "
+            + ", ".join(os.path.basename(p) for p in r["hoot_files_used"])
+        )
 
     # -- Per-module table
-    st.markdown("**Per-module summary**")
+    st.markdown("**Per-module summary** (WPI-derived)")
     st.dataframe(_module_summary_df(r["modules"]), hide_index=True, width="stretch")
+
+    # -- Per-motor telemetry from hoot (only when paired)
+    if _has_hoot(r):
+        st.markdown(
+            "**Per-motor telemetry** (from paired hoot — DeviceTemp, "
+            "SupplyCurrent, TorqueCurrent at higher sample rate)"
+        )
+        st.dataframe(_hoot_motor_df(r), hide_index=True, width="stretch")
 
     # -- Drive energy share + imbalance
     drive_E = np.array([m["drive"]["energy_J"] for m in r["modules"]])
@@ -185,6 +236,42 @@ def render_combined(results: list[dict]) -> None:
     c2.metric("Azim energy",  f"{total_azim_E:.2f} kJ",  f"{total_azim_E/n:.2f} kJ / match")
     c3.metric("Aligns",       f"{total_aligns}",         f"{total_aligns/n:.1f} / match")
     c4.metric("X-mode evts",  f"{total_xmode}",          f"{total_xmode/n:.1f} / match")
+
+    # -- Hoot rollup (season-wide peak temp per motor)
+    matches_with_hoot = [r for r in results if r.get("hoot_files_used")]
+    if matches_with_hoot:
+        per_id_temp = {cid: -float("inf") for cid in (*CAN_DRIVE_BY_MODULE, *CAN_AZIMUTH_BY_MODULE)}
+        per_id_supc = {cid: 0.0 for cid in per_id_temp}
+        for r in matches_with_hoot:
+            for m in r["modules"]:
+                for axis_key, cid in (("drive",   m["drive_can_id"]),
+                                      ("azimuth", m["azimuth_can_id"])):
+                    h = m[axis_key].get("hoot")
+                    if not h:
+                        continue
+                    t = h.get("peak_temp_c")
+                    if t is not None:
+                        per_id_temp[cid] = max(per_id_temp[cid], t)
+                    c = h.get("peak_supply_curr")
+                    if c is not None:
+                        per_id_supc[cid] = max(per_id_supc[cid], c)
+
+        st.markdown(
+            f"**Hoot motor telemetry** (paired hoot data on "
+            f"{len(matches_with_hoot)} / {n} match{'es' if n != 1 else ''})"
+        )
+        rows = []
+        for cid in (*CAN_DRIVE_BY_MODULE, *CAN_AZIMUTH_BY_MODULE):
+            mod_idx = (CAN_DRIVE_BY_MODULE.index(cid) if cid in CAN_DRIVE_BY_MODULE
+                       else CAN_AZIMUTH_BY_MODULE.index(cid))
+            axis = "DRIVE" if cid in CAN_DRIVE_BY_MODULE else "AZIM"
+            rows.append({
+                "TalonFX":       cid,
+                "Module":        f"M{mod_idx} {axis}",
+                "Season °C pk":  None if per_id_temp[cid] == -float("inf") else round(per_id_temp[cid], 1),
+                "Season I_sup pk": round(per_id_supc[cid], 1) if per_id_supc[cid] > 0 else None,
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="content")
 
     # -- Per-module energy aggregate (across all matches)
     mod_drive_E = np.zeros(NUM_MODULES)

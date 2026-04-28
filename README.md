@@ -254,17 +254,20 @@ Outputs (default paths): `analysis/reports/joystick_summary.md`, `analysis/repor
 
 ### `analysis/drivetrain_analysis.py`
 
-Per-module swerve drivetrain analysis (CAN IDs 1–4 = drive, CAN IDs 5–8 = azimuth, indexed 0–3 in the WPI log under `SwerveDrive/Module N/`). Produces:
+Per-module swerve drivetrain analysis. CAN-ID layout for Valor's Downpour (interleaved per module): module 0 → azim 1, drive 2 ; module 1 → azim 3, drive 4 ; module 2 → azim 5, drive 6 ; module 3 → azim 7, drive 8. CANcoders 20–23 (one per module) and Pigeon 61 are on the same bus but not consumed yet. Edit `CAN_*_BY_MODULE` at the top of the script if your wiring is different. Produces:
 - Per-match: for each module, peak drive speed, mean/peak stator current (drive + azimuth), drive + azimuth energy (∫|V|·|I| dt), drive setpoint tracking error (RPS), azimuth tracking error (degrees, wrap-aware). Chassis: total energy, peak yaw rate, net heading change. Drive-energy share + imbalance flag (>10% spread = IMBALANCED). Per-cycle table for every `ALIGN_TO_TARGET` window (start, duration, settle time, energy) and every `X_MODE` window. State distribution for both `Driver Rotation State` and `Driver Translation State`.
 - Season summary: per-match table, totals + per-match averages, per-module aggregate (drive % share + peak currents) with season-wide imbalance check, settle-time histogram across all aligns.
+- Per-motor telemetry from paired hoot (when present): `DeviceTemp`, `SupplyCurrent`, `TorqueCurrent` for `Phoenix6/TalonFX-1..8`. Chassis-level peak motor temperature.
 
-Required log signals (under `SmartDashboard/SwerveDrive/`):
+Required log signals — **WPILog (required)**, under `SmartDashboard/SwerveDrive/`:
 - `Module [0-3]/Drive Motor/{Speed,Out Volt,Stator Current,Position,reqSpeed}`
 - `Module [0-3]/Azimuth Motor/{Speed,Out Volt,Stator Current,Position,Absolute Position,reqPosition}`
 - `Gyro Yaw`, `Angular Velocity`, `Driver Rotation State`, `Driver Translation State`, `Rotation Target`, `Max Rotational Velocity`
 - `DS:enabled`, `DS:autonomous`
 
-The script accepts both `*.wpilog` and `*.hoot` paths on the CLI (URL scheme switches automatically) — but the required signals above are NetworkTables fields, so a hoot-only input will return None. Hoot files require [`owlet`](https://docs.ctr-electronics.com/cli-tools.html) on `PATH`. A future iteration could merge a paired hoot file in for higher-rate motor data.
+**Hoot (optional, for higher-fidelity motor telemetry)** — if `owlet` is reachable, the script auto-pairs any non-`_rio_` `*.hoot` files in the wpilog's directory tree and pulls these per-TalonFX signals: `DeviceTemp`, `SupplyCurrent`, `TorqueCurrent`. Owlet is found on `PATH` first, then under `<repo_root>/tools/owlet*`. Without owlet, the WPI-only analysis still runs cleanly — hoot-derived fields come back `None`.
+
+The script accepts both `*.wpilog` and `*.hoot` paths on the CLI (URL scheme switches automatically) — but the chassis-state signals above are NetworkTables fields, so a hoot-only input will return None. Always pass the wpilog as the primary input.
 
 ```bash
 python -X utf8 analysis/drivetrain_analysis.py
