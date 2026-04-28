@@ -94,12 +94,9 @@ When `requirements.txt` or `pyproject.toml` changes (`git pull` brings in new de
 
 CTRE's `*.hoot` files are a proprietary binary format — only CTRE's `owlet` CLI can decode them. The `vlogger.hoot` source shells out to it under the hood, and `analysis/drivetrain_analysis.py` auto-pairs hoot files for higher-fidelity per-motor telemetry (DeviceTemp, SupplyCurrent, TorqueCurrent).
 
-To enable hoot reading, install `owlet` once on your machine. Pick whichever is easier:
+A Windows build of `owlet` is checked into [`tools/`](tools/) so cloning the repo gives you working hoot decoding out of the box. `analysis/drivetrain_analysis.py` looks for `owlet` on `PATH` first and falls back to anything matching `tools/owlet*`. If you're on macOS/Linux, drop the matching binary from CTRE's [CLI tools page](https://docs.ctr-electronics.com/cli-tools.html) into `tools/` (any name starting with `owlet*` works) or put it on `PATH` and the same code path picks it up. Bumping owlet later is just replacing the file.
 
-- **You already have Phoenix Tuner X** — `owlet` ships with it. Add the install directory to `PATH` (or copy the executable into `tools/` at the repo root, which is auto-detected).
-- **Fresh install** — grab the latest from CTRE's [CLI tools page](https://docs.ctr-electronics.com/cli-tools.html), drop it in `tools/`, or unzip somewhere on `PATH`.
-
-`tools/` is gitignored — each developer drops in their own copy (right binary for their OS + Phoenix version). Without `owlet`, the drivetrain analysis still runs cleanly on WPILog signals alone — only the hoot-derived fields come back as `None`.
+Without `owlet`, the drivetrain analysis still runs cleanly on WPILog signals alone — only the hoot-derived fields come back as `None`.
 
 ## Supported Sources
 - [x] [WPILog](https://github.com/wpilibsuite/allwpilib/blob/main/wpiutil/doc/datalog.adoc) (supports structs and protobufs)

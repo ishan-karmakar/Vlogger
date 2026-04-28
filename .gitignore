@@ -7,10 +7,6 @@ test.py
 owlet.exe
 logs/
 
-# Local owlet drop-in for hoot decoding (auto-detected by drivetrain_analysis).
-# Per-developer, platform-specific, version-drifty — don't track it.
-tools/
-
 # Generated analysis reports (all per-match + season markdown outputs)
 analysis/reports/
 
