@@ -120,11 +120,33 @@ def _sidebar() -> tuple[list[str], list[str]]:
     # -- Match multiselect
     labels = [match_label(p) for p in logs]
     label_to_path = dict(zip(labels, logs))
-    default_sel = labels  # default: all
+
+    # Scan button: re-walks the directory (already happens via find_logs above on
+    # any rerun) and auto-adds any newly-discovered logs to the user's selection.
+    # Rendered before the multiselect so it can write to session_state.match_pick
+    # before the widget instantiates.
+    if st.sidebar.button(
+        "Scan for new logs",
+        width="stretch",
+        help="Auto-add any newly-downloaded match logs to your selection. "
+             "Existing selections are preserved.",
+    ):
+        current = list(st.session_state.get("match_pick", labels))
+        new_labels = [l for l in labels if l not in current]
+        if new_labels:
+            st.session_state.match_pick = current + new_labels
+            st.toast(
+                f"Added {len(new_labels)} new match log"
+                f"{'s' if len(new_labels) != 1 else ''} to the selection.",
+                icon="↻",
+            )
+        else:
+            st.toast("No new match logs found.", icon="↻")
+
     selected_labels = st.sidebar.multiselect(
         "Matches",
         options=labels,
-        default=default_sel,
+        default=labels,  # only used on first run; session_state takes over after
         key="match_pick",
     )
     selected_paths = [label_to_path[l] for l in selected_labels]
