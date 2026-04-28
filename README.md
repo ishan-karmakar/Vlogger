@@ -90,6 +90,17 @@ When `requirements.txt` or `pyproject.toml` changes (`git pull` brings in new de
 
 `requirements.txt` is generated from `pyproject.toml` via `poetry export --without-hashes -f requirements.txt -o requirements.txt`. Regenerate after every `poetry add` / `poetry remove` so the pip path stays in sync.
 
+### Decoding `*.hoot` files (owlet)
+
+CTRE's `*.hoot` files are a proprietary binary format — only CTRE's `owlet` CLI can decode them. The `vlogger.hoot` source shells out to it under the hood, and `analysis/drivetrain_analysis.py` auto-pairs hoot files for higher-fidelity per-motor telemetry (DeviceTemp, SupplyCurrent, TorqueCurrent).
+
+To enable hoot reading, install `owlet` once on your machine. Pick whichever is easier:
+
+- **You already have Phoenix Tuner X** — `owlet` ships with it. Add the install directory to `PATH` (or copy the executable into `tools/` at the repo root, which is auto-detected).
+- **Fresh install** — grab the latest from CTRE's [CLI tools page](https://docs.ctr-electronics.com/cli-tools.html), drop it in `tools/`, or unzip somewhere on `PATH`.
+
+`tools/` is gitignored — each developer drops in their own copy (right binary for their OS + Phoenix version). Without `owlet`, the drivetrain analysis still runs cleanly on WPILog signals alone — only the hoot-derived fields come back as `None`.
+
 ## Supported Sources
 - [x] [WPILog](https://github.com/wpilibsuite/allwpilib/blob/main/wpiutil/doc/datalog.adoc) (supports structs and protobufs)
 - [x] [NetworkTables4](https://github.com/wpilibsuite/allwpilib/blob/main/ntcore/doc/networktables4.adoc) (supports structs and protobufs)
