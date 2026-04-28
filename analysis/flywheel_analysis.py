@@ -34,8 +34,6 @@ import time
 import datetime
 import contextlib
 import concurrent.futures
-import shutil
-from pathlib import Path
 import numpy as np
 from collections import defaultdict
 
@@ -46,6 +44,14 @@ def progress(msg):
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import vlogger
+
+# Sibling helper module for hoot pairing. Supports both `python analysis/foo.py`
+# (script-mode → `__package__` empty) and `from analysis import foo` (package-mode).
+try:
+    from . import _hoot
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import _hoot
 
 # -- Configuration ---------------------------------------------------------------
 
@@ -88,10 +94,7 @@ CAN_FLYWHEEL = (
     ("Right One", 31),
     ("Right Two", 32),
 )
-HOOT_DRIVETRAIN_SIGNALS = ("DeviceTemp", "SupplyCurrent", "TorqueCurrent")
-HOOT_REGEX = (
-    r"Phoenix6/TalonFX-(?:30|31|32)/(?:" + "|".join(HOOT_DRIVETRAIN_SIGNALS) + r")"
-)
+HOOT_REGEX = _hoot.hoot_regex(cid for (_, cid) in CAN_FLYWHEEL)
 
 AT_SPEED_FRACTION = 0.90
 CRUISE_TOLERANCE  = 0.5
@@ -104,60 +107,6 @@ SEP = "-" * 72
 
 # -- Data loading ----------------------------------------------------------------
 
-def _find_owlet():
-    """Locate CTRE's owlet — first PATH, then `<repo_root>/tools/`. None if missing."""
-    p = shutil.which("owlet")
-    if p:
-        return p
-    repo_root = Path(__file__).resolve().parent.parent
-    tools_dir = repo_root / "tools"
-    if tools_dir.is_dir():
-        for f in sorted(tools_dir.iterdir()):
-            if f.is_file() and f.name.lower().startswith("owlet"):
-                return str(f)
-    return None
-
-
-def _find_paired_hoots(wpilog_path):
-    """Return canivore-bus *.hoot files near a .wpilog (flywheel motors live there).
-
-    Heuristic: walk the wpilog's parent dir + 1-level subdirs; skip files with
-    `_rio_` in name (rio bus doesn't have the flywheel motors).
-    """
-    p = Path(wpilog_path)
-    if not p.exists():
-        return []
-    search_dirs = {p.parent}
-    try:
-        for d in p.parent.iterdir():
-            if d.is_dir():
-                search_dirs.add(d)
-    except OSError:
-        pass
-    hoots = []
-    for d in search_dirs:
-        for f in d.glob("*.hoot"):
-            if "_rio_" in f.name.lower():
-                continue
-            hoots.append(str(f))
-    return sorted(set(hoots))
-
-
-def _load_into_raw(raw, src):
-    """Iterate a vlogger source and append entries into the shared raw dict."""
-    with src:
-        for entry in src:
-            name = entry["name"]
-            ts   = entry["timestamp"] / 1e6
-            val  = entry["data"]
-            if isinstance(val, bool):
-                raw[name].append((ts, bool(val)))
-            elif isinstance(val, (int, float)):
-                raw[name].append((ts, float(val)))
-            elif isinstance(val, str):
-                raw[name].append((ts, val))
-
-
 def load_series(log_path):
     """Load WPI series + (optionally) any paired-hoot motor signals.
 
@@ -169,44 +118,12 @@ def load_series(log_path):
 
     url = f"wpilog:///{log_path}" if not log_path.startswith("wpilog:") else log_path
     src = vlogger.get_source(url, FLYWHEEL_REGEX)
-    _load_into_raw(raw, src)
-
-    hoot_files_used = []
-    if log_path.lower().endswith(".wpilog"):
-        owlet = _find_owlet()
-        if owlet:
-            for hpath in _find_paired_hoots(log_path):
-                try:
-                    hsrc = vlogger.get_source(f"hoot:///{hpath}", HOOT_REGEX, owlet=owlet)
-                    _load_into_raw(raw, hsrc)
-                    hoot_files_used.append(hpath)
-                except Exception as e:                          # noqa: BLE001
-                    sys.stderr.write(f"[hoot] couldn't open {hpath}: {e}\n")
+    _hoot.load_into_raw(raw, src)
+    hoot_files_used = _hoot.attach_paired_hoots(raw, log_path, HOOT_REGEX, bus="canivore")
 
     for name in raw:
         raw[name].sort(key=lambda x: x[0])
     return dict(raw), hoot_files_used
-
-
-def _hoot_motor_stats(series, canid):
-    """Per-TalonFX peak/mean stats from the paired hoot. None if no hoot data.
-
-    No interpolation: peaks/means are computed on the hoot's native timestamps,
-    which preserves the high sample rate.
-    """
-    prefix = f"Phoenix6/TalonFX-{canid}"
-    _, temp = to_np(series, f"{prefix}/DeviceTemp")
-    _, supc = to_np(series, f"{prefix}/SupplyCurrent")
-    _, tqc  = to_np(series, f"{prefix}/TorqueCurrent")
-    if temp is None and supc is None and tqc is None:
-        return None
-    return {
-        "peak_temp_c":      float(np.max(temp))         if temp is not None else None,
-        "mean_temp_c":      float(np.mean(temp))        if temp is not None else None,
-        "peak_supply_curr": float(np.max(np.abs(supc))) if supc is not None else None,
-        "mean_supply_curr": float(np.mean(np.abs(supc))) if supc is not None else None,
-        "peak_torque_curr": float(np.max(np.abs(tqc)))  if tqc  is not None else None,
-    }
 
 # -- Helpers ---------------------------------------------------------------------
 
@@ -464,7 +381,7 @@ def analyze_log(log_path):
     # references get materialized via .copy().
     # Hoot per-motor telemetry. Each entry is None when no hoot data was paired.
     hoot_motors = [
-        {"label": label, "can_id": cid, "stats": _hoot_motor_stats(series, cid)}
+        {"label": label, "can_id": cid, "stats": _hoot.motor_stats(series, cid)}
         for (label, cid) in CAN_FLYWHEEL
     ]
     hoot_temps = [m["stats"]["peak_temp_c"] for m in hoot_motors

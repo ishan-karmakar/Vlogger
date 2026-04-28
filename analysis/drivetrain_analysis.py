@@ -41,13 +41,19 @@ import time
 import datetime
 import contextlib
 import concurrent.futures
-import shutil
-from pathlib import Path
 import numpy as np
 from collections import defaultdict, Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import vlogger
+
+# Sibling helper module for hoot pairing. Supports both `python analysis/foo.py`
+# (script-mode → `__package__` empty) and `from analysis import foo` (package-mode).
+try:
+    from . import _hoot
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import _hoot
 
 # -- Configuration ---------------------------------------------------------------
 
@@ -70,13 +76,8 @@ CAN_DRIVE_BY_MODULE   = (2, 4, 6, 8)
 CAN_CANCODER_BY_MODULE = (20, 21, 22, 23)
 CAN_PIGEON             = 61
 
-# Signals we want from each TalonFX in the paired hoot. Cheap subset of the
-# ~112 signals per device; extending costs little since the regex filters at
-# the source level.
-HOOT_DRIVETRAIN_SIGNALS = ("DeviceTemp", "SupplyCurrent", "TorqueCurrent")
-HOOT_REGEX = (
-    r"Phoenix6/TalonFX-(?:[1-8])/(?:" + "|".join(HOOT_DRIVETRAIN_SIGNALS) + r")"
-)
+# Hoot pairing — drivetrain motors are CAN 1-8 on the canivore bus.
+HOOT_REGEX = _hoot.hoot_regex(range(1, 9))
 
 DRIVETRAIN_REGEX = (
     r"NT:/SmartDashboard/SwerveDrive/("
@@ -125,61 +126,6 @@ def _make_url(log_path):
     return f"wpilog:///{log_path}"
 
 
-def _find_owlet():
-    """Locate CTRE's owlet — first PATH, then `<repo_root>/tools/`. None if missing."""
-    p = shutil.which("owlet")
-    if p:
-        return p
-    repo_root = Path(__file__).resolve().parent.parent
-    tools_dir = repo_root / "tools"
-    if tools_dir.is_dir():
-        for f in sorted(tools_dir.iterdir()):
-            if f.is_file() and f.name.lower().startswith("owlet"):
-                return str(f)
-    return None
-
-
-def _find_paired_hoots(wpilog_path):
-    """Return canivore-bus *.hoot files near a .wpilog (likely contain TalonFX-1..8).
-
-    Heuristic: walk the wpilog's parent dir + 1-level subdirs; skip files with
-    `_rio_` in name (rio-bus hoots don't have the swerve drivetrain). Sorting
-    keeps the pairing deterministic across runs.
-    """
-    p = Path(wpilog_path)
-    if not p.exists():
-        return []
-    search_dirs = {p.parent}
-    try:
-        for d in p.parent.iterdir():
-            if d.is_dir():
-                search_dirs.add(d)
-    except OSError:
-        pass
-    hoots = []
-    for d in search_dirs:
-        for f in d.glob("*.hoot"):
-            if "_rio_" in f.name.lower():
-                continue
-            hoots.append(str(f))
-    return sorted(set(hoots))
-
-
-def _load_into_raw(raw, src):
-    """Iterate a vlogger source and append entries into the shared raw dict."""
-    with src:
-        for entry in src:
-            name = entry["name"]
-            ts   = entry["timestamp"] / 1e6
-            val  = entry["data"]
-            if isinstance(val, bool):
-                raw[name].append((ts, bool(val)))
-            elif isinstance(val, (int, float)):
-                raw[name].append((ts, float(val)))
-            elif isinstance(val, str):
-                raw[name].append((ts, val))
-
-
 def load_series(log_path):
     """Load WPI series + (optionally) any paired-hoot drivetrain signals.
 
@@ -190,21 +136,8 @@ def load_series(log_path):
     raw = defaultdict(list)
 
     src = vlogger.get_source(_make_url(log_path), DRIVETRAIN_REGEX)
-    _load_into_raw(raw, src)
-
-    hoot_files_used = []
-    # Only pair hoots when the primary input is a wpilog — passing a .hoot
-    # alone means the user explicitly opted in to that single source.
-    if log_path.lower().endswith(".wpilog"):
-        owlet = _find_owlet()
-        if owlet:
-            for hpath in _find_paired_hoots(log_path):
-                try:
-                    hsrc = vlogger.get_source(f"hoot:///{hpath}", HOOT_REGEX, owlet=owlet)
-                    _load_into_raw(raw, hsrc)
-                    hoot_files_used.append(hpath)
-                except Exception as e:                          # noqa: BLE001
-                    sys.stderr.write(f"[hoot] couldn't open {hpath}: {e}\n")
+    _hoot.load_into_raw(raw, src)
+    hoot_files_used = _hoot.attach_paired_hoots(raw, log_path, HOOT_REGEX, bus="canivore")
 
     for name in raw:
         raw[name].sort(key=lambda x: x[0])
@@ -302,27 +235,6 @@ def integrate_bool(ts_grid, mask):
 
 # -- Per-log analysis ------------------------------------------------------------
 
-def _hoot_motor_stats(series, canid):
-    """Per-TalonFX peak/mean stats from the paired hoot. None if no hoot data.
-
-    No interpolation: peaks/means are computed on the hoot's native timestamps,
-    which preserves the high sample rate.
-    """
-    prefix = f"Phoenix6/TalonFX-{canid}"
-    _, temp = to_np(series, f"{prefix}/DeviceTemp")
-    _, supc = to_np(series, f"{prefix}/SupplyCurrent")
-    _, tqc  = to_np(series, f"{prefix}/TorqueCurrent")
-    if temp is None and supc is None and tqc is None:
-        return None
-    return {
-        "peak_temp_c":      float(np.max(temp))       if temp is not None else None,
-        "mean_temp_c":      float(np.mean(temp))      if temp is not None else None,
-        "peak_supply_curr": float(np.max(np.abs(supc))) if supc is not None else None,
-        "mean_supply_curr": float(np.mean(np.abs(supc))) if supc is not None else None,
-        "peak_torque_curr": float(np.max(np.abs(tqc)))  if tqc  is not None else None,
-    }
-
-
 def _module_block(i, ts_grid, series):
     """Build the per-module result block. Returns dict + (drive_power_grid, azim_power_grid)."""
     ts_ds, drive_speed   = to_np(series, _drive(i, "Speed"))
@@ -390,7 +302,7 @@ def _module_block(i, ts_grid, series):
             "pos_span":           drive_pos_range,
             "tracking_err_avg":   drive_err_avg,
             "tracking_err_pk":    drive_err_pk,
-            "hoot":               _hoot_motor_stats(series, CAN_DRIVE_BY_MODULE[i]),
+            "hoot":               _hoot.motor_stats(series, CAN_DRIVE_BY_MODULE[i]),
         },
         "azimuth": {
             "mean_abs_current":   float(np.mean(np.abs(azi))),
@@ -398,7 +310,7 @@ def _module_block(i, ts_grid, series):
             "energy_J":           azim_E_J,
             "tracking_err_deg_avg": azim_err_avg,
             "tracking_err_deg_pk":  azim_err_pk,
-            "hoot":               _hoot_motor_stats(series, CAN_AZIMUTH_BY_MODULE[i]),
+            "hoot":               _hoot.motor_stats(series, CAN_AZIMUTH_BY_MODULE[i]),
         },
     }, drive_power, azim_power
 
