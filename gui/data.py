@@ -11,13 +11,21 @@ Two-tier cache:
 
 `cached_analyze` returns `{"result": dict|None, "source": "disk"|"fresh"}` so
 callers can show how many results came from cache vs were freshly computed.
+
+Parallelism:
+    Disk-cache misses are dispatched to a ProcessPoolExecutor sized to
+    `min(cpu_count, n_misses)` and recycled between tasks
+    (``max_tasks_per_child=1`` — same trick the analysis/*.py CLI scripts use,
+    because vlogger / wpiutil hold C-extension state GC can't reclaim).
+    Workers live in `gui/_worker.py` (streamlit-free import for fast spawn).
 """
 
-import os
-import sys
+import concurrent.futures
 import contextlib
 import io
+import os
 import pickle
+import sys
 from pathlib import Path
 
 import streamlit as st
@@ -30,20 +38,12 @@ if str(_REPO_ROOT) not in sys.path:
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from analysis import (  # noqa: E402
-    _hoot,
-    drivetrain_analysis,
-    flywheel_analysis,
-    intake_analysis,
-    joystick_analysis,
-)
+from analysis import _hoot  # noqa: E402
+from gui import _worker  # noqa: E402  — streamlit-free, holds ANALYSES + the worker entry point
 
-ANALYSES = {
-    "flywheel":   flywheel_analysis,
-    "intake":     intake_analysis,
-    "joystick":   joystick_analysis,
-    "drivetrain": drivetrain_analysis,
-}
+# Single source of truth for the kind→module mapping lives in _worker so the
+# pool's worker processes don't drag streamlit into their startup.
+ANALYSES = _worker.ANALYSES
 
 # Bump when any analyze_log() return-dict shape changes — older pickles will be
 # treated as misses and re-analyzed. Without this, old caches could silently
@@ -144,9 +144,17 @@ def invalidate_disk_cache(log_paths: list[str], kinds: list[str]) -> int:
     return removed
 
 
+# Sentinel distinguishes "no precomputed value" from a worker that returned
+# None (the legitimate "missing signals" case, which we still want to memoize).
+class _NotProvided:
+    pass
+_NOT_PROVIDED = _NotProvided()
+
+
 @st.cache_data(show_spinner=False, max_entries=500)
 def cached_analyze(log_path: str, mtime: float, kind: str,
-                   skip_hoot: bool = False, _on_progress=None) -> dict:
+                   skip_hoot: bool = False,
+                   _on_progress=None, _precomputed=_NOT_PROVIDED) -> dict:
     """Cached wrapper around per-analysis analyze_log().
 
     `skip_hoot` participates in the cache key so hoot / no-hoot results stay
@@ -154,10 +162,19 @@ def cached_analyze(log_path: str, mtime: float, kind: str,
     hashing) is plumbed through to `_hoot.set_progress_callback` for the
     duration of one analyze_log call so the GUI can show inner status.
 
+    `_precomputed` (also leading-underscore, also ignored by hashing) is the
+    parallel-pool trampoline: when supplied it short-circuits both the disk
+    probe AND the inline analyze_log so workers' results can be stuffed
+    straight into Streamlit's in-memory cache. The supplied value must already
+    be in the ``{"result": ..., "source": ...}`` shape callers expect.
+
     Returns `{"result": dict | None, "source": "disk" | "fresh"}`. Tries the
     on-disk pickle first; on miss runs analyze_log() and writes the result back
     to disk for next time.
     """
+    if not isinstance(_precomputed, _NotProvided):
+        return _precomputed
+
     cached = _load_from_disk(log_path, mtime, kind, skip_hoot=skip_hoot)
     if cached is not None:
         return {"result": cached, "source": "disk"}
@@ -175,56 +192,162 @@ def cached_analyze(log_path: str, mtime: float, kind: str,
     return {"result": result, "source": "fresh"}
 
 
+def _make_pool(workers: int):
+    """ProcessPoolExecutor that recycles workers after each task.
+
+    Same trick the analysis/*.py CLI scripts use — vlogger / wpiutil hold
+    C-extension state Python's GC can't reclaim, so without recycling peak
+    RSS grows without bound across logs.
+    """
+    kwargs = {"max_workers": workers}
+    if sys.version_info >= (3, 11):
+        kwargs["max_tasks_per_child"] = 1
+    return concurrent.futures.ProcessPoolExecutor(**kwargs)
+
+
 def load_results(log_paths: list[str], kind: str, *, skip_hoot: bool = False):
-    """Run cached_analyze() for each path.
+    """Run cached_analyze() for each path, parallelized across cache misses.
 
     Returns `(ok_results, failed_paths, source_counts)` where source_counts is
     `{"cached": int, "fresh": int}` so the caller can show how many results
-    came from disk vs were freshly computed.
+    came from disk vs were freshly computed. ``ok_results`` preserves
+    ``log_paths`` order regardless of the order workers finish in.
 
-    Streamlit's progress bar text reflects per-match status and (during a fresh
-    analysis) inner hoot-conversion progress so the UI doesn't look frozen
-    during the slow first load.
+    Phases:
+        1. Disk-cache probe in the parent (pickle reads are fast). Hits warm
+           Streamlit's in-memory cache via the ``_precomputed=`` trampoline.
+        2. Misses get dispatched to a ProcessPoolExecutor sized to
+           ``min(cpu_count, n_misses)`` with ``max_tasks_per_child=1`` (same
+           recycling pattern as the analysis/*.py CLI scripts). Workers live
+           in ``gui/_worker.py`` (streamlit-free import for fast spawn).
+        3. As each worker finishes, the parent writes its result to the disk
+           cache and warms ``@st.cache_data`` so subsequent reruns this
+           session don't even hit the disk cache.
+
+    Single-miss / single-CPU runs take an inline fast-path: same compute, no
+    spawn-pool overhead, AND we keep the fine-grained hoot progress callback
+    that can't survive a process boundary.
     """
     if not log_paths:
         return [], [], {"cached": 0, "fresh": 0}
 
-    ok: list[dict] = []
+    n = len(log_paths)
+    ok_by_idx: dict[int, dict] = {}
     failed: list[str] = []
     counts = {"cached": 0, "fresh": 0}
-    n = len(log_paths)
+    misses: list[tuple[int, str, float]] = []   # (idx, path, mtime)
+
     bar = st.progress(0.0, text=f"Loading {kind} ({n} log{'s' if n != 1 else ''})...")
+
+    def _record_done(idx: int, p: str, mtime: float, result, *, fresh: bool) -> None:
+        """Centralised bookkeeping for one finished (path, kind).
+
+        Runs in the parent process for both inline and pool paths so disk
+        cache writes + Streamlit cache warming live in one place.
+        """
+        if result is None:
+            failed.append(p)
+            return
+        ok_by_idx[idx] = result
+        if fresh:
+            counts["fresh"] += 1
+            _save_to_disk(p, mtime, kind, result, skip_hoot=skip_hoot)
+        else:
+            counts["cached"] += 1
+        cached_analyze(
+            p, mtime, kind, skip_hoot=skip_hoot,
+            _precomputed={"result": result, "source": "fresh" if fresh else "disk"},
+        )
+
     try:
+        # Phase 1: disk-cache probe.
         for i, p in enumerate(log_paths):
             try:
                 mtime = os.path.getmtime(p)
             except OSError:
                 failed.append(p)
                 continue
-            base_label = f"{kind} {i+1}/{n} · {os.path.basename(p)}"
-            bar.progress(i / n, text=f"Loading {base_label} …")
-
-            def _on_progress(msg: str, _label=base_label, _i=i, _n=n):
-                bar.progress(_i / _n, text=f"Loading {_label} — {msg}")
-
-            try:
-                wrapped = cached_analyze(p, mtime, kind,
-                                         skip_hoot=skip_hoot,
-                                         _on_progress=_on_progress)
-            except Exception as e:                      # noqa: BLE001
-                st.warning(f"{kind}: failed to analyze `{os.path.basename(p)}`: {e}")
-                failed.append(p)
+            cached = _load_from_disk(p, mtime, kind, skip_hoot=skip_hoot)
+            if cached is None:
+                misses.append((i, p, mtime))
                 continue
-            r   = wrapped["result"]
-            src = wrapped["source"]
-            if r is None:
-                failed.append(p)
+            _record_done(i, p, mtime, cached, fresh=False)
+            done_total = len(ok_by_idx) + len(failed)
+            bar.progress(done_total / n,
+                         text=f"{kind}: {done_total}/{n} (from cache)")
+
+        # Phase 2: compute the misses.
+        if misses:
+            n_misses = len(misses)
+            n_workers = max(1, min(os.cpu_count() or 4, n_misses))
+            done_misses = 0
+
+            def _bump(p: str) -> None:
+                """Push the progress bar after a single miss completes."""
+                nonlocal done_misses
+                done_misses += 1
+                done_total = len(ok_by_idx) + len(failed)
+                bar.progress(
+                    done_total / n,
+                    text=f"{kind}: {done_misses}/{n_misses} freshly analyzed "
+                         f"({n_workers} worker{'s' if n_workers != 1 else ''})",
+                )
+
+            if n_workers == 1 or n_misses == 1:
+                # Inline path: no spawn-pool overhead. Set the hoot progress
+                # callback in the parent so the bar text reflects long owlet
+                # conversions.
+                for idx, p, mtime in misses:
+                    label = f"{kind} · {os.path.basename(p)}"
+                    bar.progress((len(ok_by_idx) + len(failed)) / n,
+                                 text=f"Loading {label} …")
+
+                    def _on_progress(msg: str, _label=label):
+                        bar.progress(
+                            (len(ok_by_idx) + len(failed)) / n,
+                            text=f"Loading {_label} — {msg}",
+                        )
+
+                    _hoot.set_progress_callback(_on_progress)
+                    try:
+                        try:
+                            _, _, result = _worker.analyze_one((p, kind, skip_hoot))
+                        except Exception as e:           # noqa: BLE001
+                            st.warning(f"{kind}: failed to analyze "
+                                       f"`{os.path.basename(p)}`: {e}")
+                            failed.append(p)
+                            _bump(p)
+                            continue
+                    finally:
+                        _hoot.set_progress_callback(None)
+                    _record_done(idx, p, mtime, result, fresh=True)
+                    _bump(p)
             else:
-                ok.append(r)
-                counts["fresh" if src == "fresh" else "cached"] += 1
-            bar.progress((i + 1) / n, text=f"Loading {kind} … {i+1}/{n}")
+                ex = _make_pool(n_workers)
+                try:
+                    submitted = {
+                        ex.submit(_worker.analyze_one, (p, kind, skip_hoot)):
+                            (idx, p, mtime)
+                        for idx, p, mtime in misses
+                    }
+                    for fut in concurrent.futures.as_completed(submitted):
+                        idx, p, mtime = submitted[fut]
+                        try:
+                            _, _, result = fut.result()
+                        except Exception as e:           # noqa: BLE001
+                            st.warning(f"{kind}: failed to analyze "
+                                       f"`{os.path.basename(p)}`: {e}")
+                            failed.append(p)
+                            _bump(p)
+                            continue
+                        _record_done(idx, p, mtime, result, fresh=True)
+                        _bump(p)
+                finally:
+                    ex.shutdown(wait=True, cancel_futures=True)
     finally:
         bar.empty()
+
+    ok = [ok_by_idx[i] for i in sorted(ok_by_idx)]
     return ok, failed, counts
 
 
