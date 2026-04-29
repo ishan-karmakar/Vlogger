@@ -59,7 +59,12 @@ ANALYSES = _worker.ANALYSES
 # v5: skip_hoot toggle baked into the cache filename so hoot/no-hoot results
 #     don't collide. Pickles compute identically across versions but the file
 #     path was renamed.
-CACHE_VERSION = 5
+# v6: feeder / hopper / shot analyses added. Existing kinds' result dicts are
+#     unchanged in shape, but the universal hoot regex grew (CAN 14/15/51/52
+#     joined the cache scope) — old hoot pkls would feed flywheel / intake /
+#     drivetrain stale-but-valid data, while feeder / hopper would see empty
+#     motor_stats from those legacy pkls. Bumping forces a clean rebuild.
+CACHE_VERSION = 6
 CACHE_DIR_NAME = ".vlogger_cache"
 
 

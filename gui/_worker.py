@@ -26,9 +26,12 @@ if str(_REPO_ROOT / "src") not in sys.path:
 from analysis import (  # noqa: E402
     _hoot,
     drivetrain_analysis,
+    feeder_analysis,
     flywheel_analysis,
+    hopper_analysis,
     intake_analysis,
     joystick_analysis,
+    shot_analysis,
 )
 
 ANALYSES = {
@@ -36,6 +39,9 @@ ANALYSES = {
     "intake":     intake_analysis,
     "joystick":   joystick_analysis,
     "drivetrain": drivetrain_analysis,
+    "feeder":     feeder_analysis,
+    "hopper":     hopper_analysis,
+    "shot":       shot_analysis,
 }
 
 

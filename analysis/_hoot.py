@@ -77,12 +77,16 @@ DEFAULT_SIGNALS = ("DeviceTemp", "SupplyCurrent", "TorqueCurrent")
 UNIVERSAL_CAN_IDS = (
     *range(1, 9),   # drivetrain (4 drive + 4 azimuth, IDs 1-8 on canivore)
     12, 13,         # intake (rio bus, IDs 12-13)
+    14, 15,         # hopper (rio bus, IDs 14-15)
     30, 31, 32,     # flywheel (canivore bus, IDs 30-32)
+    51, 52,         # feeder (canivore bus, IDs 51-52)
 )
 
 # Bump when UNIVERSAL_CAN_IDS or DEFAULT_SIGNALS changes — older pkls are
 # treated as misses and re-converted from the source hoot.
-HOOT_CACHE_VERSION = 1
+# v2: added hopper (14, 15) and feeder (51, 52) for the new feeder /
+#     hopper / shot analyses.
+HOOT_CACHE_VERSION = 2
 
 # Persistent cache of filtered hoot data alongside each *.hoot file.
 # Pre-v1: cache held the multi-GB wpilog rollovers verbatim.

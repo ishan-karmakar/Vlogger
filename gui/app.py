@@ -27,16 +27,19 @@ import streamlit as st
 
 from gui.data import find_logs, invalidate_disk_cache, load_results, match_label
 from gui.tabs import drivetrain as drivetrain_tab
+from gui.tabs import feeder as feeder_tab
 from gui.tabs import flywheel as flywheel_tab
+from gui.tabs import hopper as hopper_tab
 from gui.tabs import intake as intake_tab
 from gui.tabs import joystick as joystick_tab
+from gui.tabs import shot as shot_tab
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DIR = str(REPO_ROOT / "logs")
 LOGO_PATH = str(Path(__file__).resolve().parent / "assets" / "valor_logo.png")
 
-ALL_KINDS = ("flywheel", "intake", "joystick", "drivetrain")
+ALL_KINDS = ("flywheel", "feeder", "hopper", "intake", "drivetrain", "joystick", "shot")
 
 # NB: set_page_config + st.logo were previously at module scope. They moved
 # into main() so worker subprocesses (which on Windows re-import this file
@@ -276,6 +279,9 @@ def main() -> None:
         "intake":     intake_tab,
         "joystick":   joystick_tab,
         "drivetrain": drivetrain_tab,
+        "feeder":     feeder_tab,
+        "hopper":     hopper_tab,
+        "shot":       shot_tab,
     }
     tabs = st.tabs([k.capitalize() for k in kinds])
     for tab, k in zip(tabs, kinds):
