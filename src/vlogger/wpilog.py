@@ -18,7 +18,18 @@ class WPILog(BaseSource):
         self.regex = regex
         self.field_map = {}
         self.type_decoder = TypeDecoder()
-        self.log = DataLogReader(ident.path.lstrip('/'))
+        # Convert the URL path component to a filesystem path that
+        # DataLogReader can open. Per RFC 8089 a `file:///` URL's path is
+        # the absolute filesystem path (already starting with `/` on POSIX).
+        # On Windows the drive letter follows the leading slash
+        # (`/C:/Users/...`), and that leading slash needs to be stripped
+        # so the result is a valid native path. The previous implementation
+        # called `lstrip('/')` which worked on Windows but corrupted POSIX
+        # absolute paths into relative ones.
+        path = ident.path
+        if (len(path) >= 3 and path[0] == '/' and path[2] == ':'):
+            path = path[1:]   # Windows: `/C:/Users/...` -> `C:/Users/...`
+        self.log = DataLogReader(path)
     
     def __enter__(self):
         pass
