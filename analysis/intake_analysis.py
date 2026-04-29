@@ -28,13 +28,14 @@ from collections import defaultdict, Counter
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import vlogger
 
-# Sibling helper module for hoot pairing. Supports both `python analysis/foo.py`
+# Sibling helper modules. Supports both `python analysis/foo.py`
 # (script-mode → `__package__` empty) and `from analysis import foo` (package-mode).
 try:
-    from . import _hoot
+    from . import _hoot, _cycles
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import _hoot
+    import _cycles
 
 # -- Configuration ---------------------------------------------------------------
 
@@ -132,22 +133,15 @@ def peak_in_window(ts_grid, signal, t_start, t_end):
 # -- State-based cycle detection -------------------------------------------------
 
 def find_state_windows(state_pts, target_state):
-    """Find contiguous windows where state == target_state."""
-    windows = []
-    in_win  = False
-    t_start = None
-    for ts, val in state_pts:
-        if not in_win and val == target_state:
-            in_win  = True
-            t_start = ts
-        elif in_win and val != target_state:
-            in_win = False
-            if ts - t_start >= MIN_CYCLE_SECS:
-                windows.append((t_start, ts))
-            t_start = None
-    if in_win and t_start is not None:
-        windows.append((t_start, state_pts[-1][0]))
-    return windows
+    """Find contiguous windows where state == target_state.
+
+    Backwards-compat shim — delegates to ``_cycles.find_state_windows``,
+    using intake's MIN_CYCLE_SECS and the "close on any non-target"
+    convention (intake / feeder / hopper share this; flywheel uses a
+    stricter close-on-DISABLE rule)."""
+    return _cycles.find_state_windows(
+        state_pts, target_state, min_cycle_secs=MIN_CYCLE_SECS,
+    )
 
 def count_jams_in_window(jam_pts, t_start, t_end):
     """Count rising edges of the jam signal within the window."""

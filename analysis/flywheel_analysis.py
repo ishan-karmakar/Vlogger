@@ -45,13 +45,14 @@ def progress(msg):
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import vlogger
 
-# Sibling helper module for hoot pairing. Supports both `python analysis/foo.py`
+# Sibling helper modules. Supports both `python analysis/foo.py`
 # (script-mode → `__package__` empty) and `from analysis import foo` (package-mode).
 try:
-    from . import _hoot
+    from . import _hoot, _cycles
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import _hoot
+    import _cycles
 
 # -- Configuration ---------------------------------------------------------------
 
@@ -160,21 +161,14 @@ def peak_in_window(ts_grid, signal, t_start, t_end):
 # -- State-based cycle detection -------------------------------------------------
 
 def find_shoot_windows(state_pts):
-    windows  = []
-    in_shoot = False
-    t_start  = None
-    for ts, val in state_pts:
-        if not in_shoot and val == "SHOOT":
-            in_shoot = True
-            t_start  = ts
-        elif in_shoot and val == "DISABLE":
-            in_shoot = False
-            if ts - t_start >= MIN_CYCLE_SECS:
-                windows.append((t_start, ts))
-            t_start = None
-    if in_shoot and t_start is not None:
-        windows.append((t_start, state_pts[-1][0]))
-    return windows
+    """Flywheel SHOOT windows. Closes on DISABLE specifically (transient
+    intermediate states stay inside the window). Thin wrapper around the
+    shared helper; kept for cross-module callers (e.g. shot_analysis)."""
+    return _cycles.find_state_windows(
+        state_pts, "SHOOT",
+        min_cycle_secs=MIN_CYCLE_SECS,
+        end_state="DISABLE",
+    )
 
 def angular_error(yaw_rad, target_rad):
     """Shortest-path angular error wrapped to [-pi, pi]."""
